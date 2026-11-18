@@ -1,0 +1,8 @@
+# build output
+/sbpanel
+/build/
+/dist/
+
+# local runs
+/dev-data/
+*.log
