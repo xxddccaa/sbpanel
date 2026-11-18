@@ -14,12 +14,10 @@ v2rayN 这类客户端需要图形界面。sbpanel 把它们最常用的几项�
 </p>
 
 - **一个可执行文件**：Go 编写，只用标准库，网页打包在程序里，没有其他依赖
-- **一行命令安装**：自动注册 systemd 服务、开机自启，没装 sing-box 的话顺便装上
+- **一行命令安装**：有 systemd 就注册成服务并开机自启；容器、Kubernetes、没有 root 的环境也能装，改用后台进程运行；没装 sing-box 的话顺便装上
 - **终端里也能管**：`sbpanel` 打开管理菜单，可以查看状态、启停服务、看日志、改密码、更新、卸载
 
 ## 安装
-
-用 root 运行：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/xxddccaa/sbpanel/main/install.sh)
@@ -28,13 +26,25 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xxddccaa/sbpanel/main/instal
 安装完会打印面板地址和登录密码：
 
 ```
-✓ sbpanel v0.1.0 已安装并启动，已开启开机自启
+✓ sbpanel v0.2.0 已安装并启动
+  运行方式  systemd 服务
   网页面板  http://192.168.1.10:8091
   登录密码  Xk7mP2qRtW9a  （请记下来；忘了运行 sbpanel passwd 重设）
   管理命令  sbpanel（打开管理菜单）
+  开机自启  已开启
 ```
 
-- 支持 x86_64、arm64、armv7、i386，需要 systemd。
+安装方式会根据环境自动选择，不需要加任何参数：
+
+| 环境 | 安装位置 | 运行方式 | 开机自启 |
+|------|----------|----------|----------|
+| root，有 systemd | `/usr/local/bin`、`/var/lib/sbpanel` | systemd 服务 | 有 |
+| root，没有 systemd（Docker、Kubernetes 等容器） | 同上 | 后台进程 | 没有，重启后运行 `sbpanel start` |
+| 普通用户，或者系统目录只读 | `~/.local/bin`、`~/.local/share/sbpanel` | 后台进程 | 没有，重启后运行 `sbpanel start` |
+
+- systemd 存在但启动服务失败时，也会自动改用后台进程，安装不会因此失败；问题解决后再运行一次安装就会换回 systemd。
+- 在容器里想让它随容器一起启动：把 `sbpanel start` 加到容器的启动脚本里，或者让容器、supervisord 直接运行 `sbpanel serve`。
+- 支持 x86_64、arm64、armv7、i386。
 - 服务器访问不了 GitHub 时，可以加一个加速前缀：`GH_PROXY=https://ghfast.top/ bash <(curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/xxddccaa/sbpanel/main/install.sh)`。也可以设置 `HTTPS_PROXY`。
 - 换面板端口：在命令末尾加 `--port 8092`。只允许本机访问：加 `--listen 127.0.0.1:8091`。
 - 下载的文件都会按 `sha256sums.txt` 校验。sing-box 安装包按 GitHub 提供的 SHA-256 校验。
@@ -48,10 +58,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xxddccaa/sbpanel/main/instal
 5. 让服务器上的程序走代理。状态卡片上的“复制终端命令”会生成这一行：
 
    ```bash
-   export http_proxy=http://127.0.0.1:7890 https_proxy=http://127.0.0.1:7890 all_proxy=socks5h://127.0.0.1:7890
+   export http_proxy=http://127.0.0.1:10826 https_proxy=http://127.0.0.1:10826 all_proxy=socks5h://127.0.0.1:10826
    ```
 
-代理端口默认 `127.0.0.1:7890`，同时支持 HTTP 和 SOCKS5。在“设置”里可以改端口，也可以开放给局域网，开放时建议设置用户名和密码。
+代理端口默认 `127.0.0.1:10826`，同时支持 HTTP 和 SOCKS5。在“设置”里可以改端口，也可以开放给局域网，开放时建议设置用户名和密码。
 
 ### 绕过大陆
 
@@ -85,9 +95,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xxddccaa/sbpanel/main/instal
 直接运行 `sbpanel` 会打开管理菜单：
 
 ```
-  sbpanel 管理菜单  v0.1.0
+  sbpanel 管理菜单  v0.2.0
   ─────────────────────────────────
-  服务: ● 运行中（已运行 3 小时，内存 45 MB）   开机自启: 已开启
+  服务: ● 运行中（已运行 3 小时，内存 45 MB）
+  运行方式: systemd 服务   开机自启: 已开启
   面板: http://192.168.1.10:8091
 
    1. 查看详细状态
@@ -107,22 +118,23 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xxddccaa/sbpanel/main/instal
 |------|------|
 | `sbpanel status` | 服务状态、面板地址、sing-box 版本、当前节点，并实际测一次代理是否可用 |
 | `sbpanel start` / `stop` / `restart` | 启动、停止、重启（停止时代理也会一起停） |
-| `sbpanel enable` / `disable` | 开启、关闭开机自启 |
-| `sbpanel logs [-f]` | 查看日志，`-f` 持续输出 |
+| `sbpanel enable` / `disable` | 开启、关闭开机自启（只有 systemd 服务方式支持） |
+| `sbpanel logs [-f]` | 查看日志，`-f` 持续输出（systemd 方式读 journald，后台进程方式读日志文件） |
 | `sbpanel passwd` | 重设面板密码（直接回车随机生成） |
 | `sbpanel listen 127.0.0.1:8091` | 修改面板监听地址；只写端口也行，比如 `sbpanel listen 8092` |
 | `sbpanel update` | 更新到最新版本 |
-| `sbpanel uninstall [--purge]` | 卸载；默认保留订阅和设置，加 `--purge` 一起删除 |
+| `sbpanel uninstall [--purge]` | 卸载；默认保留订阅、设置和面板密码，重新安装后继续使用；加 `--purge` 一起删除 |
 
 `sbpanel status` 的输出示例：
 
 ```
-sbpanel v0.1.0
+sbpanel v0.2.0
   服务      ● 运行中（已运行 3 小时，内存 45 MB）
+  运行方式  systemd 服务
   开机自启  已开启
   网页面板  http://192.168.1.10:8091
   sing-box  1.14.4 （系统 /usr/local/bin/sing-box）
-  代理      127.0.0.1:7890  HTTP 和 SOCKS5 都行
+  代理      127.0.0.1:10826  HTTP 和 SOCKS5 都行
   绕过大陆  开
   订阅      1 个，共 7 个节点
   当前节点  🇭🇰 香港 01 · Reality（手动选择）
@@ -132,7 +144,7 @@ sbpanel v0.1.0
 ## 安全
 
 - 面板要用密码登录。密码用 PBKDF2 加盐哈希保存；登录凭证放在 HttpOnly、SameSite=Strict 的 Cookie 里；修改类请求有 CSRF 防护；连续输错 5 次密码锁定 1 分钟。
-- 服务用 systemd 的临时用户（`DynamicUser`）运行，不需要 root，也不能改动系统文件。
+- 用 systemd 运行时，服务以临时用户（`DynamicUser`）身份运行，不需要 root，也不能改动系统文件。少数系统不支持这些沙箱选项，会自动改用普通的 systemd 服务。
 - **面板走的是明文 HTTP。** 默认监听 `0.0.0.0:8091`，方便在局域网里用。在公网服务器上，建议只监听本机，再用 SSH 隧道访问：
 
   ```bash
@@ -155,12 +167,13 @@ sbpanel v0.1.0
 
 ## 文件位置
 
-| 路径 | 内容 |
-|------|------|
-| `/usr/local/bin/sbpanel` | 程序 |
-| `/etc/sbpanel/sbpanel.env` | 服务设置（面板监听地址等） |
-| `/etc/systemd/system/sbpanel.service` | systemd 服务 |
-| `/var/lib/sbpanel/` | 订阅、设置、面板密码、生成的 sing-box 配置、规则文件、面板安装的内核 |
+| root 安装 | 普通用户安装 | 内容 |
+|-----------|--------------|------|
+| `/usr/local/bin/sbpanel` | `~/.local/bin/sbpanel` | 程序（安装时下载的 sing-box 也放在这里） |
+| `/etc/sbpanel/sbpanel.env` | `~/.config/sbpanel/sbpanel.env` | 服务设置（面板监听地址等） |
+| `/var/lib/sbpanel/` | `~/.local/share/sbpanel/` | 订阅、设置、面板密码、生成的 sing-box 配置、规则文件、面板安装的内核 |
+| journald | `~/.local/share/sbpanel/sbpanel.log` | 日志（root 用后台进程方式时在 `/var/log/sbpanel/sbpanel.log`） |
+| `/etc/systemd/system/sbpanel.service` | — | systemd 服务（只有 systemd 方式才有） |
 
 ## 从源码构建
 
@@ -182,7 +195,8 @@ make dist        # 交叉编译所有架构，输出到 dist/
 |------|------|
 | `main.go` | 命令行入口、`serve` |
 | `manage.go` | 终端管理：状态、启停、日志、菜单 |
-| `install.go` | 安装、更新、卸载、systemd 服务 |
+| `install.go` | 安装、更新、卸载 |
+| `service.go` | 运行方式：systemd 服务或后台进程，自动选择 |
 | `app.go` | 业务逻辑：订阅、选节点、测速、设置，以及失败回滚 |
 | `config.go` | 生成 sing-box 配置，用 `sing-box check` 校验并剔除不支持的节点 |
 | `subscription.go` | 下载订阅、识别格式、提取节点 |

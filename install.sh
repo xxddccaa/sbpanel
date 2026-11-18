@@ -3,6 +3,11 @@
 #
 #   bash <(curl -fsSL https://raw.githubusercontent.com/xxddccaa/sbpanel/main/install.sh)
 #
+# 自动选择安装方式：
+#   root + systemd       装成 systemd 服务，开机自启
+#   root，没有 systemd   （容器、Kubernetes 等）装到系统目录，以后台进程运行
+#   普通用户             装到 ~/.local，以后台进程运行
+#
 # 可选环境变量：
 #   SBPANEL_VERSION=v0.1.0          安装指定版本（默认最新版）
 #   GH_PROXY=https://ghfast.top/    访问不了 GitHub 时使用的加速前缀
@@ -22,10 +27,10 @@ die() {
 }
 
 [ "$(uname -s)" = "Linux" ] || die "只支持 Linux"
-[ "$(id -u)" -eq 0 ] || die "需要 root 权限。请切换到 root，或者运行：sudo bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh)\""
-command -v systemctl >/dev/null 2>&1 || die "需要 systemd"
 command -v tar >/dev/null 2>&1 || die "需要 tar"
-command -v sha256sum >/dev/null 2>&1 || die "需要 sha256sum（coreutils）"
+if [ "$(id -u)" -ne 0 ]; then
+	echo "→ 当前不是 root，将安装到 ~/.local（只对当前用户有效，没有开机自启）"
+fi
 
 case "$(uname -m)" in
 x86_64 | amd64) ARCH=amd64 ;;
@@ -62,7 +67,21 @@ download() {
 	return 1
 }
 
-TMP="$(mktemp -d)"
+# exec_tmpdir prints a new temporary directory that allows running programs. /tmp is
+# often mounted noexec (hardened servers, Docker --tmpfs), so try a few places.
+exec_tmpdir() {
+	local base dir
+	for base in "${TMPDIR:-/tmp}" /var/tmp "${HOME:-/root}/.cache" /dev/shm "$PWD"; do
+		mkdir -p "$base" 2>/dev/null || continue
+		dir="$(mktemp -d "${base}/sbpanel-install.XXXXXX" 2>/dev/null)" || continue
+		printf '#!/bin/sh\nexit 0\n' >"${dir}/probe" 2>/dev/null && chmod 700 "${dir}/probe" && "${dir}/probe" 2>/dev/null &&
+			{ rm -f "${dir}/probe"; echo "$dir"; return 0; }
+		rm -rf "$dir"
+	done
+	return 1
+}
+
+TMP="$(exec_tmpdir)" || die "找不到可以运行程序的临时目录（/tmp 等都禁止执行）。可以设置 TMPDIR 指向一个允许执行的目录再运行"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "→ 下载 sbpanel ${VERSION}（linux/${ARCH}）…"
@@ -71,8 +90,18 @@ download "${BASE}/${ASSET}" "${TMP}/${ASSET}" ||
 download "${BASE}/sha256sums.txt" "${TMP}/sha256sums.txt" || die "下载校验文件失败"
 
 echo "→ 校验 SHA-256…"
-(cd "$TMP" && grep " ${ASSET}\$" sha256sums.txt | sha256sum -c --status) ||
-	die "SHA-256 校验失败，文件可能不完整或被篡改"
+expected="$(awk -v name="$ASSET" '$2 == name || $2 == "*" name { print $1 }' "${TMP}/sha256sums.txt")"
+[ -n "$expected" ] || die "校验文件里没有 ${ASSET}"
+if command -v sha256sum >/dev/null 2>&1; then
+	actual="$(sha256sum "${TMP}/${ASSET}" | awk '{ print $1 }')"
+elif command -v shasum >/dev/null 2>&1; then
+	actual="$(shasum -a 256 "${TMP}/${ASSET}" | awk '{ print $1 }')"
+elif command -v openssl >/dev/null 2>&1; then
+	actual="$(openssl dgst -sha256 "${TMP}/${ASSET}" | awk '{ print $NF }')"
+else
+	die "需要 sha256sum、shasum 或 openssl 之一来校验下载的文件"
+fi
+[ "$actual" = "$expected" ] || die "SHA-256 校验失败，文件可能不完整或被篡改"
 
 tar -xzf "${TMP}/${ASSET}" -C "$TMP" sbpanel
 chmod 755 "${TMP}/sbpanel"

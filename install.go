@@ -21,11 +21,8 @@ import (
 
 const (
 	githubRepo         = "xxddccaa/sbpanel"
-	systemSingBoxPath  = "/usr/local/bin/sing-box"
-	singBoxMarkerPath  = "/etc/sbpanel/.sing-box-installed-by-sbpanel"
 	cliDownloadTimeout = 15 * time.Minute
 	cliAPITimeout      = 30 * time.Second
-	panelStartTimeout  = 20 * time.Second
 )
 
 const unitTemplate = `[Unit]
@@ -35,12 +32,19 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-EnvironmentFile=-` + envPath + `
-ExecStart=` + installedBinary + ` serve
+EnvironmentFile=-%s
+ExecStart=%s serve
 Restart=on-failure
 RestartSec=5
+%s
+[Install]
+WantedBy=multi-user.target
+`
 
-# Runs as a throwaway system user; state lives in /var/lib/sbpanel.
+// The hardened unit runs as a throwaway user with state in /var/lib/sbpanel. Some
+// systems (old kernels, nested containers) cannot set that sandbox up; the plain
+// unit is the fallback.
+const unitSandbox = `
 DynamicUser=yes
 StateDirectory=sbpanel
 StateDirectoryMode=0700
@@ -49,13 +53,32 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
 `
 
-func writeUnit() error {
-	return writeFileAtomic(unitPath, []byte(unitTemplate), 0o644)
+const unitPlain = `
+Environment=SBPANEL_DATA=` + systemDataDir + `
+LimitNOFILE=65535
+`
+
+func unitContent(l layout, sandbox bool) string {
+	extra := unitPlain
+	if sandbox {
+		extra = unitSandbox
+	}
+	return fmt.Sprintf(unitTemplate, l.EnvFile, l.Binary, extra)
+}
+
+func writeUnit(l layout) error {
+	return writeUnitVariant(l, !unitIsPlain())
+}
+
+func writeUnitVariant(l layout, sandbox bool) error {
+	return writeFileAtomic(unitPath, []byte(unitContent(l, sandbox)), 0o644)
+}
+
+func unitIsPlain() bool {
+	data, err := os.ReadFile(unitPath)
+	return err == nil && !strings.Contains(string(data), "DynamicUser=yes")
 }
 
 // ---- install ----
@@ -66,118 +89,205 @@ func runInstall(args []string) error {
 	portFlag := flags.Int("port", 0, "只修改面板端口")
 	skipSingBox := flags.Bool("skip-sing-box", false, "不要自动安装 sing-box")
 	flags.Parse(args)
-	if err := requireRoot(); err != nil {
-		return err
-	}
-	if err := requireSystemd(); err != nil {
-		return err
-	}
 
-	upgrading := fileExists(unitPath)
-	before := queryUnit()
-	oldListen := currentPanelListen()
-	listen := oldListen
-	if listen == "" {
-		listen = defaultPanelListen
-	}
-	if *listenFlag != "" {
-		listen = *listenFlag
-	}
-	if *portFlag != 0 {
-		host, _, err := net.SplitHostPort(listen)
-		if err != nil {
-			host = "0.0.0.0"
+	l := currentLayout()
+	if err := l.writable(); err != nil {
+		if !l.System {
+			return fmt.Errorf("没有地方可以安装: %w", err)
 		}
-		listen = net.JoinHostPort(host, strconv.Itoa(*portFlag))
+		printWarn("系统目录不能写（%v），改为装到 %s", err, filepath.Dir(filepath.Dir(userLayout().Binary)))
+		l = userLayout()
+		if err := l.writable(); err != nil {
+			return fmt.Errorf("没有地方可以安装: %w", err)
+		}
 	}
-	if err := validateListen(listen); err != nil {
+	upgrading := l.installed()
+	listen, err := chooseListen(l, *listenFlag, *portFlag)
+	if err != nil {
 		return err
 	}
-	serviceHoldsPort := before.Active == "active" && listen == oldListen
-	if !serviceHoldsPort && !canListen(listen) {
-		return fmt.Errorf("面板端口 %s 已经被别的程序占用了，换一个：sbpanel install --port 8092", listen)
-	}
 
-	if err := installSelf(); err != nil {
+	if err := installSelf(l); err != nil {
 		return fmt.Errorf("复制程序失败: %w", err)
 	}
-
 	if !*skipSingBox {
-		if path, _ := activeKernelPath(); path == "" {
+		if path, _ := activeKernelPath(l); path == "" {
 			printStep("没有找到 sing-box，下载官方最新稳定版…")
-			if err := installSystemSingBox(); err != nil {
+			if err := installSingBox(l); err != nil {
 				printWarn("sing-box 安装失败: %v", err)
 				printWarn("可以稍后在网页面板“设置 → sing-box 内核”里安装，或者设置 GH_PROXY 后重新运行 sbpanel install")
 			}
 		}
 	}
+	if err := writeListenToEnvFile(l.EnvFile, listen); err != nil {
+		return err
+	}
+	freshAuth := !fileExists(filepath.Join(l.DataDir, "auth.json"))
 
-	if err := writePanelListen(listen); err != nil {
+	manager, err := startInstalled(l, listen)
+	if err != nil {
 		return err
 	}
-	if err := writeUnit(); err != nil {
-		return err
+
+	reportCore(l)
+	password := ""
+	if freshAuth {
+		password = randomPassword(12)
+		if err := setPanelPassword(l.DataDir, password); err != nil {
+			return err
+		}
 	}
-	if err := systemctl("daemon-reload"); err != nil {
-		return err
+	printInstallSummary(l, manager, listen, upgrading, password)
+	return nil
+}
+
+// chooseListen keeps the configured panel address unless asked to change it, and
+// makes sure the port is free (or already ours).
+func chooseListen(l layout, listenFlag string, portFlag int) (string, error) {
+	listen := l.panelListen()
+	if listenFlag != "" {
+		listen = listenFlag
 	}
-	if err := systemctl("enable", serviceName); err != nil {
-		return err
+	if portFlag != 0 {
+		host, _, err := net.SplitHostPort(listen)
+		if err != nil {
+			host = "0.0.0.0"
+		}
+		listen = net.JoinHostPort(host, strconv.Itoa(portFlag))
 	}
-	freshAuth := !fileExists(filepath.Join(serviceDataDir, "auth.json"))
-	startedAt := time.Now().Add(-time.Second)
-	printStep("启动服务…")
-	if err := systemctl("restart", serviceName); err != nil {
-		return err
+	if err := validateListen(listen); err != nil {
+		return "", err
+	}
+	ours := l.installed() && managerFor(l).Status().Running && listen == l.panelListen()
+	if !ours && !canListen(listen) {
+		return "", fmt.Errorf("面板端口 %s 已经被别的程序占用了，换一个：sbpanel install --port 8092", listen)
+	}
+	return listen, nil
+}
+
+// startInstalled (re)starts the panel with whatever this machine supports, falling
+// back step by step: sandboxed systemd unit, plain systemd unit, background process.
+func startInstalled(l layout, listen string) (serviceManager, error) {
+	if l.System && systemdUsable() {
+		manager, err := startWithSystemd(l, listen)
+		if err == nil {
+			return manager, nil
+		}
+		printWarn("没能用 systemd 启动（%v），改用后台进程运行", err)
+		removeUnit()
+	} else if l.System && fileExists(unitPath) {
+		removeUnit() // systemd is gone (say, the disk moved into a container)
+	}
+
+	manager := directManager{l: l}
+	printStep("以后台进程启动…")
+	if err := manager.Restart(); err != nil {
+		return nil, err
 	}
 	if !waitForPanel(listen, panelStartTimeout) {
 		fmt.Println()
-		_ = showLogs(false, 20)
-		return errors.New("服务没有正常启动，上面是最近的日志")
+		_ = manager.Logs(false, 20)
+		return nil, errors.New("面板没有正常启动，上面是最近的日志")
 	}
+	return manager, nil
+}
 
-	password := ""
-	if freshAuth {
-		password = firstStartPassword(startedAt)
-		if password == "" {
-			password = randomPassword(12)
-			if err := setPanelPassword(serviceDataDir, password); err != nil {
-				return err
+func startWithSystemd(l layout, listen string) (serviceManager, error) {
+	// Taking over from a background process started before systemd was available.
+	_ = directManager{l: l}.Stop()
+	alignOwnership(l.DataDir)
+
+	for _, sandbox := range []bool{!unitIsPlain(), false} {
+		if err := writeUnitVariant(l, sandbox); err != nil {
+			return nil, err
+		}
+		if err := systemctl("daemon-reload"); err != nil {
+			return nil, err
+		}
+		_ = systemctl("reset-failed", serviceName)
+		printStep("启动 systemd 服务…")
+		if err := systemctl("restart", serviceName); err == nil && waitForPanel(listen, panelStartTimeout) {
+			if err := systemctl("enable", serviceName); err != nil {
+				printWarn("设置开机自启失败: %v", err)
 			}
+			return systemdManager{}, nil
 		}
+		if !sandbox || unitExitStatus() < 200 {
+			break // the panel itself failed; a plainer unit would not help
+		}
+		printWarn("这台机器不支持 systemd 的沙箱选项，改用普通方式运行")
 	}
+	_ = systemctl("stop", serviceName)
+	return nil, errors.New("服务没有正常启动，可以运行 journalctl -u sbpanel 查看原因")
+}
 
-	fmt.Println()
-	if upgrading {
-		printOK("sbpanel %s 已更新并重新启动", version)
-	} else {
-		printOK("sbpanel %s 已安装并启动，已开启开机自启", version)
+func removeUnit() {
+	if !fileExists(unitPath) {
+		return
 	}
-	urls := panelURLs(listen)
-	for i, link := range urls {
-		label := "          "
+	if systemdUsable() {
+		_ = systemctl("disable", "--now", serviceName)
+	}
+	_ = os.Remove(unitPath)
+	if systemdUsable() {
+		_ = systemctl("daemon-reload")
+		_ = systemctl("reset-failed", serviceName)
+	}
+}
+
+func printInstallSummary(l layout, manager serviceManager, listen string, upgrading bool, password string) {
+	fmt.Println()
+	verb := "已安装并启动"
+	if upgrading {
+		verb = "已更新并重新启动"
+	}
+	printOK("sbpanel %s %s", version, verb)
+	row := func(label, value string) { fmt.Printf("  %s  %s\n", padDisplay(label, 8), value) }
+	row("运行方式", manager.Describe())
+	for i, link := range panelURLs(listen) {
+		label := ""
 		if i == 0 {
-			label = "  网页面板"
+			label = "网页面板"
 		}
-		fmt.Printf("%s  %s\n", label, colorBold(link))
+		row(label, colorBold(link))
 	}
 	if password != "" {
-		fmt.Printf("  登录密码  %s  %s\n", colorBold(password), colorDim("（请记下来；忘了运行 sbpanel passwd 重设）"))
+		row("登录密码", colorBold(password)+"  "+colorDim("（请记下来；忘了运行 sbpanel passwd 重设）"))
 	} else {
-		fmt.Println("  登录密码  " + colorDim("没有改变（忘了运行 sbpanel passwd 重设）"))
+		row("登录密码", colorDim("没有改变（忘了运行 sbpanel passwd 重设）"))
 	}
-	fmt.Println("  管理命令  " + colorBold("sbpanel") + colorDim("（打开管理菜单）"))
+	command := "sbpanel"
+	if !l.System && !onPath(filepath.Dir(l.Binary)) {
+		command = l.Binary
+	}
+	row("管理命令", colorBold(command)+colorDim("（打开管理菜单）"))
+	if supported, enabled := manager.Autostart(); !supported {
+		row("开机自启", colorDim("不支持（"+autostartUnsupportedReason(l)+"），机器或容器重启后运行 "+command+" start"))
+	} else if enabled {
+		row("开机自启", "已开启")
+	}
+	if !l.System && command != "sbpanel" {
+		fmt.Println(colorDim("  想直接输入 sbpanel：把 " + filepath.Dir(l.Binary) + " 加到 PATH"))
+	}
 	if host, port, _ := net.SplitHostPort(listen); net.ParseIP(host).IsUnspecified() {
 		local := "127.0.0.1:" + port
 		fmt.Println()
 		fmt.Println(colorDim("  面板是明文 HTTP。在公网服务器上，建议运行 sbpanel listen " + local + "，"))
 		fmt.Println(colorDim("  然后用 SSH 隧道访问：ssh -L " + port + ":" + local + " 用户@服务器，再打开 http://" + local))
 	}
-	return nil
 }
 
-// installSelf copies the running binary to /usr/local/bin/sbpanel.
-func installSelf() error {
+func onPath(dir string) bool {
+	for _, entry := range filepath.SplitList(os.Getenv("PATH")) {
+		if filepath.Clean(entry) == filepath.Clean(dir) {
+			return true
+		}
+	}
+	return false
+}
+
+// installSelf copies the running binary to the layout's install path.
+func installSelf(l layout) error {
 	self, err := os.Executable()
 	if err != nil {
 		return err
@@ -185,15 +295,18 @@ func installSelf() error {
 	if resolved, err := filepath.EvalSymlinks(self); err == nil {
 		self = resolved
 	}
-	if self == installedBinary {
+	if self == l.Binary {
 		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(l.Binary), 0o755); err != nil {
+		return err
 	}
 	source, err := os.Open(self)
 	if err != nil {
 		return err
 	}
 	defer source.Close()
-	staged := installedBinary + ".new"
+	staged := l.Binary + ".new"
 	target, err := os.OpenFile(staged, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
 	if err != nil {
 		return err
@@ -205,30 +318,42 @@ func installSelf() error {
 		return errors.Join(copyErr, closeErr)
 	}
 	// rename keeps a running old binary intact (it holds the old inode).
-	if err := os.Rename(staged, installedBinary); err != nil {
+	if err := os.Rename(staged, l.Binary); err != nil {
 		os.Remove(staged)
 		return err
 	}
-	printStep("已安装到 %s", installedBinary)
+	printStep("已安装到 %s", l.Binary)
 	return nil
 }
 
-var firstPasswordPattern = regexp.MustCompile(`已生成网页面板密码: (\S+)`)
+func setPanelPassword(dataDir, password string) error {
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return err
+	}
+	authPath := filepath.Join(dataDir, "auth.json")
+	if err := NewAuth(authPath).SetPassword(password); err != nil {
+		return err
+	}
+	// When root writes into the service's DynamicUser-owned directory, hand it back.
+	chownLike(authPath, dataDir)
+	return nil
+}
 
-// firstStartPassword finds the password the service generated on its first start.
-func firstStartPassword(since time.Time) string {
-	for range 20 {
-		output, _ := exec.Command("journalctl", "-u", serviceName, "--no-pager", "-o", "cat",
-			"--since", "@"+strconv.FormatInt(since.Unix(), 10)).Output()
-		if match := firstPasswordPattern.FindSubmatch(output); match != nil {
-			return string(match[1])
-		}
-		time.Sleep(250 * time.Millisecond)
+// ---- sing-box for the command line ----
+
+func (l layout) singBoxPath() string { return filepath.Join(filepath.Dir(l.Binary), "sing-box") }
+
+// systemSingBox finds a sing-box outside the panel's data directory: the one the
+// installer put next to sbpanel, or any on PATH.
+func systemSingBox(l layout) string {
+	if path := l.singBoxPath(); fileExists(path) {
+		return path
+	}
+	if path, err := exec.LookPath("sing-box"); err == nil {
+		return path
 	}
 	return ""
 }
-
-// ---- downloads from GitHub (command line, runs as root) ----
 
 // mirrorURLs prefixes GitHub URLs with $GH_PROXY (for example https://ghfast.top/),
 // for servers that cannot reach GitHub directly. HTTPS_PROXY is honoured as usual.
@@ -283,7 +408,7 @@ func findAsset(release *githubRelease, name string) (*githubAsset, error) {
 }
 
 // cliDownloadAsset downloads one release asset into dir and checks its SHA-256.
-func cliDownloadAsset(ctx context.Context, release *githubRelease, asset *githubAsset, dir string, sums map[string]string) (string, error) {
+func cliDownloadAsset(ctx context.Context, asset *githubAsset, dir string, sums map[string]string) (string, error) {
 	want, ok := strings.CutPrefix(asset.Digest, "sha256:")
 	if !ok {
 		want = sums[asset.Name]
@@ -311,8 +436,8 @@ func cliDownloadAsset(ctx context.Context, release *githubRelease, asset *github
 	return path, nil
 }
 
-// installSystemSingBox puts the latest stable official sing-box at /usr/local/bin.
-func installSystemSingBox() error {
+// installSingBox puts the latest stable official sing-box next to sbpanel.
+func installSingBox(l layout) error {
 	ctx, cancel := context.WithTimeout(context.Background(), cliDownloadTimeout)
 	defer cancel()
 	release, err := cliGitHubRelease(ctx, "SagerNet/sing-box", "")
@@ -332,11 +457,12 @@ func installSystemSingBox() error {
 		return err
 	}
 	defer os.RemoveAll(dir)
-	archive, err := cliDownloadAsset(ctx, release, asset, dir, nil)
+	archive, err := cliDownloadAsset(ctx, asset, dir, nil)
 	if err != nil {
 		return err
 	}
-	staged := systemSingBoxPath + ".new"
+	target := l.singBoxPath()
+	staged := target + ".new"
 	if err := extractFromTarball(archive, "sing-box", staged, 0o755); err != nil {
 		os.Remove(staged)
 		return err
@@ -346,13 +472,13 @@ func installSystemSingBox() error {
 		os.Remove(staged)
 		return err
 	}
-	if err := os.Rename(staged, systemSingBoxPath); err != nil {
+	if err := os.Rename(staged, target); err != nil {
 		os.Remove(staged)
 		return err
 	}
-	_ = os.MkdirAll(envDir, 0o755)
-	_ = os.WriteFile(singBoxMarkerPath, []byte(systemSingBoxPath+"\n"), 0o644)
-	printOK("sing-box %s 已安装到 %s（SHA-256 校验通过）", got, systemSingBoxPath)
+	_ = os.MkdirAll(l.ConfigDir, 0o755)
+	_ = os.WriteFile(l.singBoxMarker(), []byte(target+"\n"), 0o644)
+	printOK("sing-box %s 已安装到 %s（SHA-256 校验通过）", got, target)
 	return nil
 }
 
@@ -371,12 +497,6 @@ func runUpdate(args []string) error {
 	tag := flags.String("version", "", "安装指定版本，例如 v0.1.0（默认最新版）")
 	force := flags.Bool("force", false, "版本相同也重新安装")
 	flags.Parse(args)
-	if err := requireRoot(); err != nil {
-		return err
-	}
-	if err := requireSystemd(); err != nil {
-		return err
-	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), cliDownloadTimeout)
 	defer cancel()
@@ -413,7 +533,7 @@ func runUpdate(args []string) error {
 		})
 	}
 	printStep("下载 %s %s…", release.TagName, assetName)
-	archive, err := cliDownloadAsset(ctx, release, asset, dir, sums)
+	archive, err := cliDownloadAsset(ctx, asset, dir, sums)
 	if err != nil {
 		return err
 	}
@@ -426,7 +546,7 @@ func runUpdate(args []string) error {
 		return errors.New("下载的文件不是 sbpanel，已取消")
 	}
 	printOK("下载完成，SHA-256 校验通过：%s", strings.TrimSpace(string(output)))
-	// The new binary installs itself, so unit-file changes in the new version apply too.
+	// The new binary installs itself, so install-logic changes in the new version apply too.
 	command := exec.Command(binary, "install")
 	command.Stdin, command.Stdout, command.Stderr = os.Stdin, os.Stdout, os.Stderr
 	return command.Run()
@@ -485,9 +605,7 @@ func runUninstall(args []string) error {
 	purge := flags.Bool("purge", false, "同时删除订阅、设置、面板密码和面板安装的 sing-box")
 	yes := flags.Bool("y", false, "不再确认")
 	flags.Parse(args)
-	if err := requireRoot(); err != nil {
-		return err
-	}
+	l := currentLayout()
 	if !*yes && stdinIsTerminal() {
 		what := "服务和程序（订阅和设置会保留）"
 		if *purge {
@@ -501,39 +619,61 @@ func runUninstall(args []string) error {
 			return nil
 		}
 	}
-	return uninstall(*purge)
+	return uninstall(l, *purge)
 }
 
-func uninstall(purge bool) error {
-	if fileExists(unitPath) {
-		_ = systemctl("disable", "--now", serviceName)
-		if purge {
-			if err := systemctl("clean", "--what=state", serviceName); err != nil {
-				_ = os.RemoveAll("/var/lib/private/sbpanel")
-				_ = os.Remove(serviceDataDir)
-			}
-		}
-		_ = os.Remove(unitPath)
-		_ = systemctl("daemon-reload")
-		_ = systemctl("reset-failed", serviceName)
-	} else if purge {
-		_ = os.RemoveAll("/var/lib/private/sbpanel")
-		_ = os.Remove(serviceDataDir)
+func uninstall(l layout, purge bool) error {
+	_ = directManager{l: l}.Stop()
+	if l.System {
+		removeUnit()
 	}
 	removedSingBox := false
-	if fileExists(singBoxMarkerPath) {
-		removedSingBox = os.Remove(systemSingBoxPath) == nil
+	if fileExists(l.singBoxMarker()) {
+		removedSingBox = os.Remove(l.singBoxPath()) == nil
+		_ = os.Remove(l.singBoxMarker())
 	}
-	_ = os.RemoveAll(envDir)
-	_ = os.Remove(installedBinary)
+	_ = os.Remove(l.Binary)
+	if purge {
+		_ = os.RemoveAll(l.ConfigDir)
+		removeDataDir(l)
+	} else {
+		_ = os.Remove(l.PIDFile)
+	}
 
 	printOK("sbpanel 已卸载")
 	if removedSingBox {
-		printOK("安装时下载的 %s 也已删除", systemSingBoxPath)
+		printOK("安装时下载的 %s 也已删除", l.singBoxPath())
 	}
 	if !purge {
-		fmt.Println(colorDim("  订阅和设置保留在 /var/lib/private/sbpanel，重新安装后会继续使用；"))
-		fmt.Println(colorDim("  要彻底删除，运行: rm -rf /var/lib/private/sbpanel"))
+		kept := []string{dataLocation(l), l.ConfigDir}
+		if logDir := filepath.Dir(l.LogFile); l.System && fileExists(l.LogFile) {
+			kept = append(kept, logDir)
+		}
+		fmt.Println(colorDim("  订阅、设置和面板密码保留了下来，重新安装后会继续使用。要彻底删除，运行："))
+		fmt.Println(colorDim("  rm -rf " + strings.Join(kept, " ")))
 	}
 	return nil
+}
+
+// dataLocation is where the data really is: with systemd's DynamicUser,
+// /var/lib/sbpanel is only a link into /var/lib/private.
+func dataLocation(l layout) string {
+	if l.System && fileExists(filepath.Join(systemPrivateDataDir, "state.json")) {
+		return systemPrivateDataDir
+	}
+	return l.DataDir
+}
+
+func removeDataDir(l layout) {
+	if l.System {
+		_ = os.RemoveAll(systemPrivateDataDir)
+		_ = os.RemoveAll(systemLogDir)
+	}
+	if info, err := os.Lstat(l.DataDir); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		_ = os.Remove(l.DataDir)
+	} else {
+		_ = os.RemoveAll(l.DataDir)
+	}
+	_ = os.Remove(l.LogFile)
+	_ = os.Remove(l.LogFile + ".1")
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -99,9 +100,99 @@ func TestMirrorURLs(t *testing.T) {
 	}
 }
 
-func TestUnitTemplateUsesEnvFile(t *testing.T) {
-	if !strings.Contains(unitTemplate, "EnvironmentFile=-"+envPath) || strings.Contains(unitTemplate, "--listen") {
-		t.Fatal("unit must take the listen address from the env file")
+func TestUnitContentVariants(t *testing.T) {
+	l := systemLayout()
+	sandboxed := unitContent(l, true)
+	plain := unitContent(l, false)
+	for _, unit := range []string{sandboxed, plain} {
+		if !strings.Contains(unit, "EnvironmentFile=-"+l.EnvFile) || !strings.Contains(unit, "ExecStart="+l.Binary+" serve") || strings.Contains(unit, "--listen") {
+			t.Fatalf("unit must take its settings from the env file:\n%s", unit)
+		}
+	}
+	if !strings.Contains(sandboxed, "DynamicUser=yes") || strings.Contains(plain, "DynamicUser") {
+		t.Fatal("only the sandboxed unit uses DynamicUser")
+	}
+	if !strings.Contains(plain, "SBPANEL_DATA="+systemDataDir) {
+		t.Fatal("the plain unit must point at the same data directory")
+	}
+}
+
+func TestLayouts(t *testing.T) {
+	system := systemLayout()
+	if !system.System || system.Binary != "/usr/local/bin/sbpanel" || system.DataDir != "/var/lib/sbpanel" {
+		t.Fatalf("system layout = %+v", system)
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	user := userLayout()
+	if user.System || user.Binary != filepath.Join(home, ".local/bin/sbpanel") ||
+		user.DataDir != filepath.Join(home, ".local/share/sbpanel") || user.EnvFile != filepath.Join(home, ".config/sbpanel/sbpanel.env") {
+		t.Fatalf("user layout = %+v", user)
+	}
+	if user.installed() {
+		t.Fatal("empty home must not count as installed")
+	}
+	if err := writeListenToEnvFile(user.EnvFile, "127.0.0.1:9100"); err != nil {
+		t.Fatal(err)
+	}
+	if user.installed() || user.panelListen() != "127.0.0.1:9100" {
+		t.Fatal("settings kept after an uninstall must not count as installed, but must still be read")
+	}
+	os.MkdirAll(filepath.Dir(user.Binary), 0o755)
+	os.WriteFile(user.Binary, []byte("#!/bin/sh\n"), 0o755)
+	if !user.installed() {
+		t.Fatal("binary plus settings file is an installation")
+	}
+}
+
+func TestReadEnvFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sbpanel.env")
+	os.WriteFile(path, []byte("# comment\n\nSBPANEL_LISTEN=0.0.0.0:8091\n  SBPANEL_SECURE_COOKIE = \"1\"\nbroken line\n"), 0o644)
+	settings, err := readEnvFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(settings, ";") != "SBPANEL_LISTEN=0.0.0.0:8091;SBPANEL_SECURE_COOKIE=1" {
+		t.Fatalf("settings = %v", settings)
+	}
+	if missing, err := readEnvFile(filepath.Join(t.TempDir(), "none")); err != nil || missing != nil {
+		t.Fatal("a missing env file is not an error")
+	}
+}
+
+func TestSystemdUsableHonoursOverride(t *testing.T) {
+	t.Setenv(serviceManagerEnv, managerDirect)
+	if systemdUsable() {
+		t.Fatal("SBPANEL_SERVICE_MANAGER=direct must disable systemd")
+	}
+}
+
+func TestCoreArgsUseConfig(t *testing.T) {
+	dir := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	os.Symlink(dir, link)
+	config := resolvedFile(filepath.Join(link, "config.json"))
+	args := []string{"/usr/bin/sing-box", "--disable-color", "run", "-c", filepath.Join(dir, "config.json"), "-D", dir}
+	if !coreArgsUseConfig(args, config) {
+		t.Fatal("same file through a symlinked directory must match")
+	}
+	if coreArgsUseConfig([]string{"sing-box", "run", "-c", "/etc/sing-box/config.json"}, config) {
+		t.Fatal("other configs must not match")
+	}
+}
+
+func TestPIDFileIsVerified(t *testing.T) {
+	dir := t.TempDir()
+	m := directManager{l: layout{PIDFile: filepath.Join(dir, "sbpanel.pid"), DataDir: dir}}
+	os.WriteFile(m.l.PIDFile, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o644)
+	if m.pid() != 0 {
+		t.Fatal("a live PID that is not `sbpanel serve` must be ignored")
+	}
+	os.WriteFile(m.l.PIDFile, []byte("999999999\n"), 0o644)
+	if m.pid() != 0 || m.Status().Running {
+		t.Fatal("a dead PID must count as stopped")
 	}
 }
 
@@ -111,5 +202,20 @@ func TestPadDisplayCountsWideCharacters(t *testing.T) {
 	}
 	if got := padDisplay("sing-box", 8); got != "sing-box" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestDefaultProxyPort(t *testing.T) {
+	if defaultSettings().ListenPort != 10826 {
+		t.Fatalf("default proxy port = %d, want 10826", defaultSettings().ListenPort)
+	}
+}
+
+func TestAlignOwnershipLeavesMatchingFilesAlone(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "state.json"), []byte("{}"), 0o600)
+	alignOwnership(dir) // same owner already: must be a no-op and not fail
+	if _, err := os.Stat(filepath.Join(dir, "state.json")); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -113,7 +113,7 @@ func defaultDataDir() string {
 	if dir := os.Getenv("STATE_DIRECTORY"); dir != "" { // set by systemd StateDirectory=
 		return dir
 	}
-	return "/var/lib/sbpanel"
+	return currentLayout().DataDir
 }
 
 func runServe(args []string) error {
@@ -136,6 +136,11 @@ func runServe(args []string) error {
 		return err
 	}
 	defer unlock()
+	// Holding the lock means no other panel uses this directory, so a sing-box still
+	// running its config was orphaned (the panel was killed) and would hold the ports.
+	if killed := killStaleCores(*dataDir); killed > 0 {
+		log.Printf("结束了 %d 个上次遗留的 sing-box 进程", killed)
+	}
 	kernel := NewKernel(systemBinary, filepath.Join(*dataDir, "kernel"))
 	if kernel.Active() == "" {
 		log.Printf("还没有安装 sing-box：可以在网页面板“设置 → sing-box 内核”里一键安装")
@@ -271,23 +276,13 @@ func runPasswd(args []string) error {
 	if err := setPanelPassword(*dataDir, *password); err != nil {
 		return err
 	}
+	if !fileExists(filepath.Join(*dataDir, "state.json")) && !currentLayout().installed() {
+		printWarn("%s 里还没有 sbpanel 的数据，确认数据目录是否正确（--data）", *dataDir)
+	}
 	if generated {
 		fmt.Printf("新密码: %s\n", colorBold(*password))
 	}
 	fmt.Println("密码已更新，所有已登录的浏览器需要重新登录")
-	return nil
-}
-
-func setPanelPassword(dataDir, password string) error {
-	if err := os.MkdirAll(dataDir, 0o700); err != nil {
-		return err
-	}
-	authPath := filepath.Join(dataDir, "auth.json")
-	if err := NewAuth(authPath).SetPassword(password); err != nil {
-		return err
-	}
-	// When run as root against the service's directory, hand the file back to the service user.
-	chownLike(authPath, dataDir)
 	return nil
 }
 
@@ -330,7 +325,7 @@ func lockDataDir(dir string) (func(), error) {
 	}
 	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		file.Close()
-		return nil, fmt.Errorf("数据目录 %s 已经被另一个 sbpanel 使用（是不是 systemd 服务在运行？）", dir)
+		return nil, fmt.Errorf("数据目录 %s 已经被另一个 sbpanel 使用（服务已经在运行？用 sbpanel status 查看）", dir)
 	}
 	return func() { file.Close() }, nil
 }

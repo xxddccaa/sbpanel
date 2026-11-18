@@ -24,10 +24,13 @@ type Settings struct {
 	BypassChina bool   `json:"bypassChina"`
 }
 
+// defaultProxyPort is the local HTTP/SOCKS5 proxy port of a fresh installation.
+const defaultProxyPort = 10826
+
 func defaultSettings() Settings {
 	return Settings{
 		ListenAddr: "127.0.0.1",
-		ListenPort: 7890,
+		ListenPort: defaultProxyPort,
 		DNSServer:  "local",
 		TestURL:    "https://www.gstatic.com/generate_204",
 		LogLevel:   "info",

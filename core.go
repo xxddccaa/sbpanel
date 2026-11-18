@@ -255,7 +255,7 @@ func (c *Core) waitReady(ctx context.Context) error {
 		}
 		select {
 		case <-ctx.Done():
-			return errors.New("等待 sing-box 启动超时")
+			return startWaitError(ctx)
 		case <-ticker.C:
 		}
 	}
@@ -270,7 +270,7 @@ func (c *Core) waitStayUp(ctx context.Context) error {
 	if remaining > 0 {
 		select {
 		case <-ctx.Done():
-			return errors.New("等待 sing-box 启动超时")
+			return startWaitError(ctx)
 		case <-time.After(remaining):
 		}
 	}
@@ -278,6 +278,13 @@ func (c *Core) waitStayUp(ctx context.Context) error {
 		return fmt.Errorf("sing-box 启动后立即退出了，请看日志: %s", c.lastLogLine())
 	}
 	return nil
+}
+
+func startWaitError(ctx context.Context) error {
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return errors.New("sbpanel 正在退出，启动 sing-box 的过程被中断")
+	}
+	return errors.New("等待 sing-box 启动超时")
 }
 
 func (c *Core) lastLogLine() string {

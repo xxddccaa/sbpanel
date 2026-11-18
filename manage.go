@@ -11,8 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -21,14 +19,9 @@ import (
 )
 
 const (
-	serviceName        = "sbpanel"
-	unitPath           = "/etc/systemd/system/sbpanel.service"
-	envDir             = "/etc/sbpanel"
-	envPath            = "/etc/sbpanel/sbpanel.env"
-	installedBinary    = "/usr/local/bin/sbpanel"
-	serviceDataDir     = "/var/lib/sbpanel"
 	defaultPanelListen = "0.0.0.0:8091"
 	connectivityURL    = "https://cp.cloudflare.com/"
+	panelStartTimeout  = 20 * time.Second
 )
 
 // ---- terminal output ----
@@ -63,137 +56,6 @@ func printStep(format string, args ...any) {
 	fmt.Println(colorDim("→ ") + fmt.Sprintf(format, args...))
 }
 
-// ---- preconditions ----
-
-func requireRoot() error {
-	if os.Geteuid() != 0 {
-		return errors.New("需要 root 权限，请用 sudo 运行（例如 sudo sbpanel）")
-	}
-	return nil
-}
-
-func requireSystemd() error {
-	if _, err := exec.LookPath("systemctl"); err != nil {
-		return errors.New("这台机器没有 systemd，暂不支持自动安装；可以手动运行 sbpanel serve")
-	}
-	if info, err := os.Stat("/run/systemd/system"); err != nil || !info.IsDir() {
-		return errors.New("systemd 没有在运行（容器里？），暂不支持自动安装；可以手动运行 sbpanel serve")
-	}
-	return nil
-}
-
-func requireInstalled() error {
-	if err := requireRoot(); err != nil {
-		return err
-	}
-	if !fileExists(unitPath) {
-		return errors.New("sbpanel 还没有安装成服务，先运行 sbpanel install")
-	}
-	return nil
-}
-
-// ---- systemd ----
-
-func systemctl(args ...string) error {
-	output, err := exec.Command("systemctl", args...).CombinedOutput()
-	if err != nil {
-		message := strings.TrimSpace(string(output))
-		if message == "" {
-			message = err.Error()
-		}
-		return fmt.Errorf("systemctl %s: %s", strings.Join(args, " "), message)
-	}
-	return nil
-}
-
-type unitStatus struct {
-	Loaded   bool
-	Active   string // active, inactive, failed, activating, ...
-	Enabled  string // enabled, disabled, ...
-	MainPID  int
-	Since    time.Time
-	MemoryMB float64
-}
-
-func queryUnit() unitStatus {
-	output, _ := exec.Command("systemctl", "show", serviceName, "--no-pager",
-		"-p", "LoadState,ActiveState,UnitFileState,MainPID,ActiveEnterTimestampMonotonic,MemoryCurrent").Output()
-	values := map[string]string{}
-	for _, line := range strings.Split(string(output), "\n") {
-		if key, value, ok := strings.Cut(line, "="); ok {
-			values[key] = value
-		}
-	}
-	status := unitStatus{
-		Loaded:  values["LoadState"] == "loaded",
-		Active:  values["ActiveState"],
-		Enabled: values["UnitFileState"],
-	}
-	status.MainPID, _ = strconv.Atoi(values["MainPID"])
-	if memory, err := strconv.ParseFloat(values["MemoryCurrent"], 64); err == nil && memory < 1<<50 {
-		status.MemoryMB = memory / (1 << 20)
-	}
-	if micros, err := strconv.ParseInt(values["ActiveEnterTimestampMonotonic"], 10, 64); err == nil && micros > 0 {
-		status.Since = bootTime().Add(time.Duration(micros) * time.Microsecond)
-	}
-	return status
-}
-
-// bootTime derives the boot time from /proc/uptime, so systemd's monotonic
-// timestamps can be shown as a duration without parsing localized dates.
-func bootTime() time.Time {
-	data, err := os.ReadFile("/proc/uptime")
-	if err != nil {
-		return time.Now()
-	}
-	fields := strings.Fields(string(data))
-	if len(fields) == 0 {
-		return time.Now()
-	}
-	seconds, err := strconv.ParseFloat(fields[0], 64)
-	if err != nil {
-		return time.Now()
-	}
-	return time.Now().Add(-time.Duration(seconds * float64(time.Second)))
-}
-
-func describeActive(status unitStatus) string {
-	switch status.Active {
-	case "active":
-		text := colorGreen("● 运行中")
-		var extra []string
-		if !status.Since.IsZero() {
-			if uptime := time.Since(status.Since); uptime < time.Minute {
-				extra = append(extra, "刚刚启动")
-			} else {
-				extra = append(extra, "已运行 "+humanDuration(uptime))
-			}
-		}
-		if status.MemoryMB > 0 {
-			extra = append(extra, fmt.Sprintf("内存 %.0f MB", status.MemoryMB))
-		}
-		if len(extra) > 0 {
-			text += colorDim("（" + strings.Join(extra, "，") + "）")
-		}
-		return text
-	case "activating", "reloading":
-		return colorYellow("● 正在启动")
-	case "failed":
-		return colorRed("● 启动失败") + colorDim("（sbpanel logs 查看原因）")
-	case "":
-		return colorDim("● 未安装")
-	default:
-		return colorDim("● 已停止")
-	}
-}
-
-func describeEnabled(status unitStatus) string {
-	if status.Enabled == "enabled" {
-		return colorGreen("已开启")
-	}
-	return colorYellow("未开启")
-}
-
 // padDisplay pads text to width terminal columns; CJK characters take two columns.
 func padDisplay(text string, width int) string {
 	columns := 0
@@ -223,27 +85,40 @@ func humanDuration(duration time.Duration) string {
 	}
 }
 
-// ---- panel listen address (/etc/sbpanel/sbpanel.env) ----
+// ---- preconditions ----
+
+// installedLayout returns the installation the current user manages.
+func installedLayout() (layout, error) {
+	l := currentLayout()
+	if !l.installed() {
+		return l, errors.New("sbpanel 还没有安装，先运行 sbpanel install")
+	}
+	return l, nil
+}
+
+// ---- panel listen address (sbpanel.env) ----
 
 var (
 	envListenPattern  = regexp.MustCompile(`(?m)^[ \t]*SBPANEL_LISTEN[ \t]*=[ \t]*"?([^"\s]+)"?[ \t]*$`)
 	unitListenPattern = regexp.MustCompile(`--listen[ =](\S+)`)
 )
 
-// currentPanelListen returns the configured panel address, also understanding the
-// pre-0.1 unit files that passed it as a command-line flag.
-func currentPanelListen() string {
-	if data, err := os.ReadFile(envPath); err == nil {
+// panelListen returns the configured panel address, also understanding the
+// v0.1.0-dev unit files that passed it as a command-line flag.
+func (l layout) panelListen() string {
+	if data, err := os.ReadFile(l.EnvFile); err == nil {
 		if match := envListenPattern.FindSubmatch(data); match != nil {
 			return string(match[1])
 		}
 	}
-	if data, err := os.ReadFile(unitPath); err == nil {
-		if match := unitListenPattern.FindSubmatch(data); match != nil {
-			return string(match[1])
+	if l.System {
+		if data, err := os.ReadFile(unitPath); err == nil {
+			if match := unitListenPattern.FindSubmatch(data); match != nil {
+				return string(match[1])
+			}
 		}
 	}
-	return ""
+	return defaultPanelListen
 }
 
 func validateListen(address string) error {
@@ -268,15 +143,11 @@ const envFileHeader = `# sbpanel 服务设置。修改后运行 sbpanel restart 
 #   127.0.0.1:8091  只有本机能访问，远程用 SSH 隧道：ssh -L 8091:127.0.0.1:8091 用户@服务器
 `
 
-// writePanelListen rewrites SBPANEL_LISTEN and keeps any other lines the user added.
-func writePanelListen(address string) error {
-	if err := os.MkdirAll(envDir, 0o755); err != nil {
+// writeListenToEnvFile rewrites SBPANEL_LISTEN and keeps any other lines the user added.
+func writeListenToEnvFile(path, address string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	return writeListenToEnvFile(envPath, address)
-}
-
-func writeListenToEnvFile(path, address string) error {
 	line := "SBPANEL_LISTEN=" + address
 	data, err := os.ReadFile(path)
 	var content string
@@ -368,32 +239,106 @@ func waitForPanel(listen string, timeout time.Duration) bool {
 	return false
 }
 
+// waitForCore waits for the proxy after the panel came up, when the proxy is meant to
+// run. It reports whether the proxy should run and whether it is up.
+func waitForCore(l layout, timeout time.Duration) (wanted, up bool) {
+	deadline := time.Now().Add(timeout)
+	for {
+		state, err := readServiceState(l)
+		if err != nil || !state.CoreEnabled || !hasSelectableNodes(state) {
+			return false, false
+		}
+		core := &Core{clashAddr: clashAddress(state.ClashPort), secret: state.ClashSecret}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err = core.clashRequest(ctx, http.MethodGet, "/version", nil, nil)
+		cancel()
+		if err == nil {
+			time.Sleep(coreStayUpTime) // same rule as the panel: it must stay up a moment
+			return true, true
+		}
+		if time.Now().After(deadline) {
+			return true, false
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
+func reportCore(l layout) {
+	if wanted, up := waitForCore(l, panelStartTimeout); wanted && !up {
+		printWarn("面板已启动，但代理（sing-box）没有启动成功，运行 sbpanel logs 查看原因")
+	}
+}
+
+func canListen(address string) bool {
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return false
+	}
+	listener.Close()
+	return true
+}
+
 // ---- status ----
 
 func runStatus(args []string) error {
-	if err := requireRoot(); err != nil {
-		return err
-	}
-	printStatus()
+	printStatus(currentLayout())
 	return nil
 }
 
-func printStatus() {
-	unit := queryUnit()
+func describeService(status serviceStatus) string {
+	switch {
+	case status.Running:
+		text := colorGreen("● 运行中")
+		var extra []string
+		if !status.Since.IsZero() {
+			if uptime := time.Since(status.Since); uptime < time.Minute {
+				extra = append(extra, "刚刚启动")
+			} else {
+				extra = append(extra, "已运行 "+humanDuration(uptime))
+			}
+		}
+		if status.MemoryMB > 0 {
+			extra = append(extra, fmt.Sprintf("内存 %.0f MB", status.MemoryMB))
+		}
+		if len(extra) > 0 {
+			text += colorDim("（" + strings.Join(extra, "，") + "）")
+		}
+		return text
+	case status.Starting:
+		return colorYellow("● 正在启动")
+	case status.Failed:
+		return colorRed("● 启动失败") + colorDim("（sbpanel logs 查看原因）")
+	default:
+		return colorDim("● 已停止") + colorDim("（sbpanel start 启动）")
+	}
+}
+
+func describeAutostart(manager serviceManager) string {
+	supported, enabled := manager.Autostart()
+	switch {
+	case !supported:
+		return colorDim("不支持（重启后运行 sbpanel start）")
+	case enabled:
+		return colorGreen("已开启")
+	default:
+		return colorYellow("未开启")
+	}
+}
+
+func printStatus(l layout) {
 	fmt.Println(colorBold("sbpanel " + version))
-	if !fileExists(unitPath) {
-		fmt.Println("  服务       " + colorDim("● 未安装") + "（运行 sbpanel install 安装）")
+	row := func(label, value string) { fmt.Printf("  %s  %s\n", padDisplay(label, 8), value) }
+	if !l.installed() {
+		row("服务", colorDim("● 未安装")+"（运行 sbpanel install 安装）")
 		return
 	}
-	row := func(label, value string) { fmt.Printf("  %s  %s\n", padDisplay(label, 8), value) }
-	row("服务", describeActive(unit))
-	row("开机自启", describeEnabled(unit))
+	manager := managerFor(l)
+	status := manager.Status()
+	row("服务", describeService(status))
+	row("运行方式", manager.Describe())
+	row("开机自启", describeAutostart(manager))
 
-	listen := currentPanelListen()
-	if listen == "" {
-		listen = defaultPanelListen
-	}
-	for i, address := range panelURLs(listen) {
+	for i, address := range panelURLs(l.panelListen()) {
 		label := ""
 		if i == 0 {
 			label = "网页面板"
@@ -401,8 +346,7 @@ func printStatus() {
 		row(label, address)
 	}
 
-	state, stateErr := readServiceState()
-	kernelPath, kernelSource := activeKernelPath()
+	kernelPath, kernelSource := activeKernelPath(l)
 	if kernelPath == "" {
 		row("sing-box", colorYellow("未安装")+"（网页面板“设置”里可以一键安装）")
 	} else {
@@ -411,12 +355,12 @@ func printStatus() {
 		cancel()
 		row("sing-box", fmt.Sprintf("%s %s", kernelVersion, colorDim("（"+kernelSource+" "+kernelPath+"）")))
 	}
-	if stateErr != nil {
+
+	state, err := readServiceState(l)
+	if err != nil {
 		row("代理", colorDim("还没有数据（面板第一次启动后才会生成）"))
 		return
 	}
-
-	proxy := localProxyURL(state.Settings)
 	proxyAddress := net.JoinHostPort(state.Settings.ListenAddr, strconv.Itoa(state.Settings.ListenPort))
 	row("代理", proxyAddress+colorDim("  HTTP 和 SOCKS5 都行"))
 	bypass := "关"
@@ -424,7 +368,6 @@ func printStatus() {
 		bypass = "开"
 	}
 	row("绕过大陆", bypass)
-
 	nodes := 0
 	for _, sub := range state.Subscriptions {
 		for _, node := range sub.Nodes {
@@ -435,7 +378,7 @@ func printStatus() {
 	}
 	row("订阅", fmt.Sprintf("%d 个，共 %d 个节点", len(state.Subscriptions), nodes))
 
-	if unit.Active != "active" {
+	if !status.Running {
 		return
 	}
 	if current := currentNodeName(state); current != "" {
@@ -445,7 +388,7 @@ func printStatus() {
 		row("连通性", colorDim("代理没有启动（在网页面板里点“启动代理”）"))
 		return
 	}
-	latency, err := testProxy(proxy)
+	latency, err := testProxy(localProxyURL(state.Settings))
 	if err != nil {
 		row("连通性", colorRed("✗ 代理不通")+colorDim("（"+err.Error()+"）"))
 	} else {
@@ -453,8 +396,8 @@ func printStatus() {
 	}
 }
 
-func readServiceState() (*State, error) {
-	data, err := os.ReadFile(filepath.Join(serviceDataDir, "state.json"))
+func readServiceState(l layout) (*State, error) {
+	data, err := os.ReadFile(filepath.Join(l.DataDir, "state.json"))
 	if err != nil {
 		return nil, err
 	}
@@ -465,13 +408,13 @@ func readServiceState() (*State, error) {
 	return state, nil
 }
 
-// activeKernelPath mirrors Kernel.Active for the installed service.
-func activeKernelPath() (string, string) {
-	managed := filepath.Join(serviceDataDir, "kernel", "sing-box")
+// activeKernelPath mirrors Kernel.Active for an installation.
+func activeKernelPath(l layout) (string, string) {
+	managed := filepath.Join(l.DataDir, "kernel", "sing-box")
 	if fileExists(managed) {
 		return managed, "面板安装"
 	}
-	if path, err := exec.LookPath("sing-box"); err == nil {
+	if path := systemSingBox(l); path != "" {
 		return path, "系统"
 	}
 	return "", ""
@@ -515,50 +458,54 @@ func testProxy(proxy *url.URL) (time.Duration, error) {
 	return time.Since(started), nil
 }
 
-// ---- start / stop / enable ----
+// ---- start / stop / autostart ----
 
 func serviceAction(action string) func([]string) error {
 	return func(args []string) error {
-		if err := requireInstalled(); err != nil {
+		l, err := installedLayout()
+		if err != nil {
 			return err
 		}
-		return doServiceAction(action)
+		return doServiceAction(l, action)
 	}
 }
 
-func doServiceAction(action string) error {
+func doServiceAction(l layout, action string) error {
+	manager := managerFor(l)
 	switch action {
 	case "start", "restart":
-		if err := systemctl(action, serviceName); err != nil {
+		var err error
+		if action == "start" {
+			err = manager.Start()
+		} else {
+			err = manager.Restart()
+		}
+		if err != nil {
 			return err
 		}
-		listen := currentPanelListen()
-		if listen == "" {
-			listen = defaultPanelListen
+		if !waitForPanel(l.panelListen(), panelStartTimeout) {
+			return errors.New("面板没有正常启动，运行 sbpanel logs 查看原因")
 		}
-		if !waitForPanel(listen, 15*time.Second) {
-			return errors.New("服务没有正常启动，运行 sbpanel logs 查看原因")
-		}
+		reportCore(l)
 		if action == "start" {
 			printOK("已启动")
 		} else {
 			printOK("已重启")
 		}
 	case "stop":
-		if err := systemctl("stop", serviceName); err != nil {
+		if err := manager.Stop(); err != nil {
 			return err
 		}
 		printOK("已停止（代理也一起停了）")
-	case "enable":
-		if err := systemctl("enable", serviceName); err != nil {
+	case "enable", "disable":
+		if err := manager.SetAutostart(action == "enable"); err != nil {
 			return err
 		}
-		printOK("已开启开机自启")
-	case "disable":
-		if err := systemctl("disable", serviceName); err != nil {
-			return err
+		if action == "enable" {
+			printOK("已开启开机自启")
+		} else {
+			printOK("已关闭开机自启（现在运行的服务不受影响）")
 		}
-		printOK("已关闭开机自启（现在运行的服务不受影响）")
 	default:
 		return fmt.Errorf("unknown action %s", action)
 	}
@@ -572,45 +519,29 @@ func runLogs(args []string) error {
 	follow := flags.Bool("f", false, "持续输出新日志（Ctrl+C 退出）")
 	lines := flags.Int("n", 100, "显示最近多少行")
 	flags.Parse(args)
-	if err := requireInstalled(); err != nil {
+	l, err := installedLayout()
+	if err != nil {
 		return err
 	}
-	return showLogs(*follow, *lines)
-}
-
-func showLogs(follow bool, lines int) error {
-	arguments := []string{"-u", serviceName, "--no-pager", "-o", "short-iso", "-n", strconv.Itoa(lines)}
-	if follow {
-		arguments = append(arguments, "-f")
-	}
-	command := exec.Command("journalctl", arguments...)
-	command.Stdin, command.Stdout, command.Stderr = os.Stdin, os.Stdout, os.Stderr
-	// Ctrl+C should end journalctl, not the menu that started it.
-	signal.Ignore(os.Interrupt)
-	defer signal.Reset(os.Interrupt)
-	err := command.Run()
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) && follow {
-		return nil
-	}
-	return err
+	return managerFor(l).Logs(*follow, *lines)
 }
 
 // ---- listen ----
 
 func runListen(args []string) error {
-	if err := requireInstalled(); err != nil {
+	l, err := installedLayout()
+	if err != nil {
 		return err
 	}
 	if len(args) != 1 {
-		fmt.Println("当前面板地址: " + currentPanelListen())
+		fmt.Println("当前面板地址: " + l.panelListen())
 		fmt.Println("修改: sbpanel listen 0.0.0.0:8091   或   sbpanel listen 127.0.0.1:8091")
 		return nil
 	}
-	return changePanelListen(args[0])
+	return changePanelListen(l, args[0])
 }
 
-func changePanelListen(address string) error {
+func changePanelListen(l layout, address string) error {
 	address = strings.TrimSpace(address)
 	if !strings.Contains(address, ":") {
 		address = "0.0.0.0:" + address // just a port
@@ -618,26 +549,28 @@ func changePanelListen(address string) error {
 	if err := validateListen(address); err != nil {
 		return err
 	}
-	current := currentPanelListen()
-	if address == current {
+	if address == l.panelListen() {
 		printOK("面板地址没有变化: %s", address)
 		return nil
 	}
 	if !canListen(address) {
 		return fmt.Errorf("%s 已经被别的程序占用了，换一个端口", address)
 	}
-	if err := writePanelListen(address); err != nil {
+	if err := writeListenToEnvFile(l.EnvFile, address); err != nil {
 		return err
 	}
-	// Older installs passed --listen in the unit; rewrite it so the env file wins.
-	if err := writeUnit(); err != nil {
-		return err
+	manager := managerFor(l)
+	if _, ok := manager.(systemdManager); ok {
+		// v0.1.0-dev units passed --listen; rewrite so the settings file wins.
+		if err := writeUnit(l); err != nil {
+			return err
+		}
+		if err := systemctl("daemon-reload"); err != nil {
+			return err
+		}
 	}
-	if err := systemctl("daemon-reload"); err != nil {
-		return err
-	}
-	if queryUnit().Active == "active" {
-		if err := doServiceAction("restart"); err != nil {
+	if manager.Status().Running {
+		if err := doServiceAction(l, "restart"); err != nil {
 			return err
 		}
 	}
@@ -648,21 +581,10 @@ func changePanelListen(address string) error {
 	return nil
 }
 
-func canListen(address string) bool {
-	listener, err := net.Listen("tcp", address)
-	if err != nil {
-		return false
-	}
-	listener.Close()
-	return true
-}
-
 // ---- interactive menu ----
 
 func runMenu() error {
-	if err := requireRoot(); err != nil {
-		return err
-	}
+	l := currentLayout()
 	input := bufio.NewReader(os.Stdin)
 	ask := func(prompt string) string {
 		fmt.Print(prompt)
@@ -684,8 +606,8 @@ func runMenu() error {
 		fmt.Println()
 		fmt.Println(colorBold("  sbpanel 管理菜单") + colorDim("  "+version))
 		fmt.Println(colorDim("  ─────────────────────────────────"))
-		if !fileExists(unitPath) {
-			fmt.Println("  还没有安装成服务。")
+		if !l.installed() {
+			fmt.Println("  还没有安装。")
 			fmt.Println()
 			fmt.Println("   1. 安装")
 			fmt.Println("   0. 退出")
@@ -699,18 +621,19 @@ func runMenu() error {
 			continue
 		}
 
-		unit := queryUnit()
-		listen := currentPanelListen()
-		if listen == "" {
-			listen = defaultPanelListen
-		}
-		urls := panelURLs(listen)
-		fmt.Printf("  服务: %s   开机自启: %s\n", describeActive(unit), describeEnabled(unit))
+		manager := managerFor(l)
+		status := manager.Status()
+		supported, enabled := manager.Autostart()
+		urls := panelURLs(l.panelListen())
+		fmt.Printf("  服务: %s\n", describeService(status))
+		fmt.Printf("  运行方式: %s   开机自启: %s\n", manager.Describe(), describeAutostart(manager))
 		if len(urls) > 0 {
 			fmt.Println("  面板: " + urls[0])
 		}
 		autostart := "开启开机自启"
-		if unit.Enabled == "enabled" {
+		if !supported {
+			autostart = "开机自启说明"
+		} else if enabled {
 			autostart = "关闭开机自启"
 		}
 		fmt.Println()
@@ -727,34 +650,38 @@ func runMenu() error {
 		switch ask("\n请选择: ") {
 		case "1":
 			fmt.Println()
-			printStatus()
+			printStatus(l)
 			pause()
 		case "2":
-			report(doServiceAction("start"))
+			report(doServiceAction(l, "start"))
 		case "3":
 			if strings.EqualFold(ask("停止后代理也会断开，确定吗？[y/N] "), "y") {
-				report(doServiceAction("stop"))
+				report(doServiceAction(l, "stop"))
 			}
 		case "4":
-			report(doServiceAction("restart"))
+			report(doServiceAction(l, "restart"))
 		case "5":
-			if unit.Enabled == "enabled" {
-				report(doServiceAction("disable"))
-			} else {
-				report(doServiceAction("enable"))
+			switch {
+			case !supported:
+				fmt.Println("  " + autostartHint(l))
+				pause()
+			case enabled:
+				report(doServiceAction(l, "disable"))
+			default:
+				report(doServiceAction(l, "enable"))
 			}
 		case "6":
-			report(showLogs(false, 60))
+			report(manager.Logs(false, 60))
 			pause()
 		case "7":
-			report(showLogs(true, 30))
+			report(manager.Logs(true, 30))
 		case "8":
 			password := readSecret("新密码（至少 8 位，直接回车随机生成）: ")
 			generated := password == ""
 			if generated {
 				password = randomPassword(12)
 			}
-			if err := setPanelPassword(serviceDataDir, password); err != nil {
+			if err := setPanelPassword(l.DataDir, password); err != nil {
 				report(err)
 			} else if generated {
 				printOK("新密码: %s", colorBold(password))
@@ -763,10 +690,10 @@ func runMenu() error {
 			}
 			pause()
 		case "9":
-			fmt.Println("  当前: " + listen)
+			fmt.Println("  当前: " + l.panelListen())
 			fmt.Println(colorDim("  可以只填端口（如 8092），或者 IP:端口。127.0.0.1:8091 表示只允许本机访问。"))
 			if answer := ask("  新地址（直接回车取消）: "); answer != "" {
-				report(changePanelListen(answer))
+				report(changePanelListen(l, answer))
 				pause()
 			}
 		case "10":
@@ -776,10 +703,10 @@ func runMenu() error {
 			fmt.Println("  卸载会删除服务和程序。订阅、设置和面板密码默认保留，重新安装后还能用。")
 			switch ask("  确定卸载吗？[y/N/purge（连数据一起删）] ") {
 			case "y", "Y":
-				report(uninstall(false))
+				report(uninstall(l, false))
 				return nil
 			case "purge":
-				report(uninstall(true))
+				report(uninstall(l, true))
 				return nil
 			}
 		case "0", "q", "":
