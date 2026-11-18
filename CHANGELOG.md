@@ -2,6 +2,11 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.2.1] - 2026-11-18
+
+### 修复
+- 下载在网络不稳定时更可靠：连接中途断开、超时或服务器 5xx 时自动重试（最多 3 次）。适用于 `sbpanel update`、安装时下载 sing-box，以及面板里的内核升级和规则文件更新
+
 ## [v0.2.0] - 2026-11-18
 
 ### 安装更灵活

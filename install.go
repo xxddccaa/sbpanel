@@ -370,7 +370,7 @@ func cliGet(ctx context.Context, raw string, header http.Header, timeout time.Du
 	client := &http.Client{Transport: transport, Timeout: timeout}
 	var failures []error
 	for _, candidate := range mirrorURLs(raw) {
-		err := fetchOnce(ctx, client, candidate, header, consume)
+		err := fetchRetry(ctx, client, candidate, header, consume)
 		if err == nil {
 			return nil
 		}

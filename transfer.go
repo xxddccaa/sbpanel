@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"syscall"
 	"time"
 )
 
@@ -46,7 +48,7 @@ func (a *App) fetchWithFallback(ctx context.Context, rawURL string, header http.
 	consume func(*http.Response) error) (string, error) {
 	var failures []error
 	for _, route := range a.transferRoutes() {
-		err := fetchOnce(ctx, newHTTPClient(route.proxy, timeout), rawURL, header, consume)
+		err := fetchRetry(ctx, newHTTPClient(route.proxy, timeout), rawURL, header, consume)
 		if err == nil {
 			return route.name, nil
 		}
@@ -72,9 +74,49 @@ func fetchOnce(ctx context.Context, client *http.Client, rawURL string, header h
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("服务器返回 HTTP %d", response.StatusCode)
+		return &httpStatusError{code: response.StatusCode}
 	}
 	return consume(response)
+}
+
+type httpStatusError struct{ code int }
+
+func (e *httpStatusError) Error() string { return fmt.Sprintf("服务器返回 HTTP %d", e.code) }
+
+const fetchAttempts = 3
+
+// retryDelay is the pause before the given retry (1s, then 4s).
+var retryDelay = func(attempt int) time.Duration { return time.Duration(attempt*attempt) * time.Second }
+
+// fetchRetry repeats fetchOnce when the failure looks like a flaky network (a dropped
+// connection, a timeout, a 5xx), which is common on the routes this tool is used on.
+func fetchRetry(ctx context.Context, client *http.Client, rawURL string, header http.Header, consume func(*http.Response) error) error {
+	var err error
+	for attempt := 1; attempt <= fetchAttempts; attempt++ {
+		err = fetchOnce(ctx, client, rawURL, header, consume)
+		if err == nil || !transientError(err) || attempt == fetchAttempts {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(retryDelay(attempt)):
+		}
+	}
+	return err
+}
+
+func transientError(err error) bool {
+	var status *httpStatusError
+	if errors.As(err, &status) {
+		return status.code >= 500 || status.code == http.StatusTooManyRequests || status.code == http.StatusRequestTimeout
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return false // nothing listens there; trying again will not help
+	}
+	var netErr net.Error
+	return errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.As(err, &netErr)
 }
 
 // stripURL drops the request URL from net/http errors. Subscription URLs carry the

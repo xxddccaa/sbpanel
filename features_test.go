@@ -243,3 +243,42 @@ func TestSwitchKernelRestoresFilesWhenStartFails(t *testing.T) {
 		t.Fatalf("files not restored: managed=%q previous=%q", managed, previous)
 	}
 }
+
+func TestFetchRetryRecoversFromDroppedConnections(t *testing.T) {
+	defer func(saved func(int) time.Duration) { retryDelay = saved }(retryDelay)
+	retryDelay = func(int) time.Duration { return time.Millisecond }
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls < 3 {
+			// Promise more bytes than we send, then hang up: the client sees unexpected EOF.
+			w.Header().Set("Content-Length", "100")
+			w.Write([]byte("partial"))
+			return
+		}
+		w.Write([]byte("complete"))
+	}))
+	defer server.Close()
+	var body []byte
+	err := fetchRetry(context.Background(), server.Client(), server.URL, nil, func(response *http.Response) error {
+		data, err := readLimited(response.Body, 1<<10)
+		body = data
+		return err
+	})
+	if err != nil || string(body) != "complete" || calls != 3 {
+		t.Fatalf("err=%v body=%q calls=%d", err, body, calls)
+	}
+}
+
+func TestFetchRetryDoesNotRepeatClientErrors(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	err := fetchRetry(context.Background(), server.Client(), server.URL, nil, func(*http.Response) error { return nil })
+	if err == nil || calls != 1 {
+		t.Fatalf("404 must fail at once: err=%v calls=%d", err, calls)
+	}
+}
