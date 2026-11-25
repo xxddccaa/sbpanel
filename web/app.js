@@ -97,11 +97,6 @@ async function api(method, path, body) {
   } catch {
     data = null;
   }
-  if (response.status === 401 && path !== '/login' && path !== '/password') {
-    ui.loggedIn = false;
-    render();
-    throw new ApiError('登录已失效，请重新登录', 401);
-  }
   if (!response.ok) throw new ApiError((data && data.error) || response.statusText, response.status);
   return data;
 }
@@ -119,7 +114,7 @@ async function act(button, action, successMessage) {
     if (successMessage) toast(successMessage);
     return true;
   } catch (error) {
-    if (error.status !== 401) toast(error.message, true);
+    toast(error.message, true);
     return false;
   } finally {
     ui.pending--;
@@ -134,7 +129,6 @@ async function act(button, action, successMessage) {
 // ---------- state ----------
 
 const ui = {
-  loggedIn: null,
   view: null,
   tab: readStored('sbpanel-tab', 'nodes'),
   showAdd: false,
@@ -144,6 +138,9 @@ const ui = {
   pending: 0,
   kernel: null,
   kernelPoll: null,
+  panel: null,
+  panelPoll: null,
+  restarting: false,
 };
 
 function readStored(key, fallback) {
@@ -163,7 +160,7 @@ function store(key, value) {
 }
 
 async function refresh(force) {
-  if (!ui.loggedIn || (ui.pending > 0 && !force)) return;
+  if (ui.pending > 0 && !force) return;
   try {
     const view = await api('GET', '/state');
     view.subscriptions = (view.subscriptions || []).map((sub) => ({ ...sub, nodes: sub.nodes || [] }));
@@ -171,12 +168,12 @@ async function refresh(force) {
     if (ui.pending > 0 && !force) return;
     renderDynamic();
   } catch (error) {
-    if (error.status !== 401) setOffline(error.message);
+    if (!ui.restarting) setOffline(error.message);
   }
 }
 
 async function refreshLogs() {
-  if (!ui.loggedIn || ui.tab !== 'logs') return;
+  if (ui.tab !== 'logs') return;
   try {
     const data = await api('GET', '/logs');
     ui.logs = data.lines || [];
@@ -221,12 +218,6 @@ function delayBadge(node) {
 function render() {
   const app = $('#app');
   app.replaceChildren();
-  if (ui.loggedIn === null) return;
-  if (!ui.loggedIn) {
-    app.append(renderLogin());
-    $('#login-password').focus();
-    return;
-  }
   app.append(
     renderHeader(),
     h('div', { id: 'offline', class: 'notice hidden' }),
@@ -237,33 +228,6 @@ function render() {
   );
   renderTabBody();
   renderDynamic();
-}
-
-function renderLogin() {
-  const input = h('input', { type: 'password', id: 'login-password', autocomplete: 'current-password', placeholder: '面板密码' });
-  const button = h('button', { class: 'primary', type: 'submit', text: '登录' });
-  const form = h('form', { class: 'stack', onsubmit: async (event) => {
-    event.preventDefault();
-    button.disabled = true;
-    button.classList.add('busy');
-    try {
-      await api('POST', '/login', { password: input.value });
-      ui.loggedIn = true;
-      render();
-      refresh();
-    } catch (error) {
-      toast(error.message, true);
-      input.select();
-    } finally {
-      button.disabled = false;
-      button.classList.remove('busy');
-    }
-  } }, input, button);
-  return h('div', { class: 'login' },
-    h('div', { class: 'brand' }, h('div', { class: 'logo', text: 'S' }), h('h1', { text: 'sbpanel' })),
-    h('div', { class: 'card' }, form,
-      h('p', { class: 'muted small', text: '首次启动的密码在 sbpanel 的日志里（journalctl -u sbpanel）。忘记密码可以在服务器上运行 sbpanel passwd 重设。' })),
-  );
 }
 
 function renderHeader() {
@@ -683,7 +647,7 @@ function renderSettings() {
   ),
   h('div', { class: 'form-actions' }, save));
 
-  return h('div', {}, settingsForm, renderKernelCard(), renderPasswordForm(), renderConfigCard());
+  return h('div', {}, settingsForm, renderPanelCard(), renderKernelCard(), renderConfigCard());
 }
 
 function renderRuleSetStatus(view) {
@@ -821,34 +785,170 @@ function renderKernelBody() {
   card.replaceChildren(h('h2', { text: 'sing-box 内核' }), ...rows);
 }
 
-function renderPasswordForm() {
-  const current = h('input', { type: 'password', autocomplete: 'current-password' });
-  const next = h('input', { type: 'password', autocomplete: 'new-password', minLength: 8 });
-  const confirmInput = h('input', { type: 'password', autocomplete: 'new-password' });
-  const submit = h('button', { class: 'primary', type: 'submit', text: '修改密码' });
-  return h('form', { class: 'card stack', onsubmit: async (event) => {
-    event.preventDefault();
-    if (next.value !== confirmInput.value) {
-      toast('两次输入的新密码不一样', true);
+// ---------- sbpanel itself ----------
+
+function renderPanelCard() {
+  const card = h('div', { class: 'card stack', id: 'panel-card' }, h('h2', { text: 'sbpanel 版本' }), h('p', { class: 'muted small', text: '读取中…' }));
+  loadPanel();
+  return card;
+}
+
+async function loadPanel() {
+  try {
+    ui.panel = await api('GET', '/panel');
+  } catch {
+    return;
+  }
+  renderPanelBody();
+  if (ui.panel.job && ui.panel.job.running) schedulePanelPoll();
+}
+
+// Keeps polling on every tab: when the download is done the panel restarts, and the
+// page has to reload to get the new version's web files.
+function schedulePanelPoll() {
+  clearTimeout(ui.panelPoll);
+  ui.panelPoll = setTimeout(async () => {
+    const before = (ui.panel && ui.panel.job) || {};
+    let panel;
+    try {
+      panel = await api('GET', '/panel');
+    } catch (error) {
+      if (error.status === 0) waitForRestart();
+      else schedulePanelPoll();
       return;
     }
-    const ok = await act(submit, () => api('POST', '/password', { current: current.value, new: next.value }), '密码已修改，其他浏览器需要重新登录');
-    if (ok) [current, next, confirmInput].forEach((input) => { input.value = ''; });
-  } },
-  h('h2', { text: '面板密码' }),
-  h('div', { class: 'form-grid' },
-    h('label', { class: 'field' }, '当前密码', current),
-    h('label', { class: 'field' }, '新密码（至少 8 位）', next),
-    h('label', { class: 'field' }, '再输一次新密码', confirmInput),
-  ),
-  h('div', { class: 'form-actions' },
-    h('button', { type: 'button', class: 'danger', text: '退出登录', onclick: async () => {
-      await api('POST', '/logout').catch(() => {});
-      ui.loggedIn = false;
-      render();
-    } }),
-    submit,
-  ));
+    const job = panel.job || {};
+    if (before.running && !job.running && !job.error) {
+      waitForRestart(); // a fresh process answered: the restart already happened
+      return;
+    }
+    ui.panel = panel;
+    renderPanelBody();
+    if (job.running) schedulePanelPoll();
+    else if (before.running && job.error) toast('升级失败：' + job.error, true);
+  }, 1000);
+}
+
+async function waitForRestart() {
+  if (ui.restarting) return;
+  ui.restarting = true;
+  clearTimeout(ui.panelPoll);
+  setOffline('sbpanel 正在重启，稍等几秒…');
+  renderPanelBody();
+  const started = Date.now();
+  while (Date.now() - started < 180000) {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    try {
+      const response = await fetch('/api/health', { cache: 'no-store' });
+      if (response.ok) {
+        location.reload();
+        return;
+      }
+    } catch {
+      /* still restarting */
+    }
+  }
+  ui.restarting = false;
+  setOffline('sbpanel 没有重新启动起来，请在服务器上运行 sbpanel status 和 sbpanel logs 查看');
+}
+
+function rememberSwitch(target) {
+  try {
+    sessionStorage.setItem('sbpanel-switch', target);
+  } catch {
+    /* private mode: no message after the reload */
+  }
+}
+
+// After the reload, says whether the switch to the new version worked.
+async function reportSwitch() {
+  let target = null;
+  try {
+    target = sessionStorage.getItem('sbpanel-switch');
+    sessionStorage.removeItem('sbpanel-switch');
+  } catch {
+    return;
+  }
+  if (!target) return;
+  try {
+    const panel = await api('GET', '/panel');
+    if (compareVersions(panel.version, target) === 0) toast('sbpanel 已切换到 ' + panel.version);
+    else toast(panel.lastError || '没有切换成功，现在还是 ' + panel.version, true);
+  } catch {
+    /* the state poll shows connection problems */
+  }
+}
+
+function renderPanelBody() {
+  const card = $('#panel-card');
+  const panel = ui.panel;
+  if (!card || !panel) return;
+  const job = panel.job || {};
+  const busy = job.running || ui.restarting;
+
+  const rows = [
+    h('div', { class: 'spread' },
+      h('div', {},
+        h('div', { class: 'status-node', text: 'sbpanel ' + panel.version }),
+        h('div', { class: 'muted small', text: panel.managed ? '在网页里升级的版本（安装时是 ' + panel.baseVersion + '）' : '安装时的版本' })),
+      h('button', { text: '检查更新', disabled: busy || !panel.supported,
+        title: '只在你点的时候访问 GitHub，优先走已启动的代理',
+        onclick: async (event) => {
+          await act(event.currentTarget, async () => { ui.panel = await api('POST', '/panel/check'); }, null);
+          renderPanelBody();
+        } })),
+  ];
+
+  if (!panel.supported) rows.push(h('p', { class: 'muted small', text: panel.unsupported }));
+
+  if (ui.restarting) {
+    rows.push(h('div', { class: 'notice', text: '正在重启，面板和代理会中断几秒钟…' }));
+  } else if (job.running) {
+    const percent = job.total ? Math.floor((job.done / job.total) * 100) : 0;
+    rows.push(h('div', { class: 'notice', text: (job.tag ? '正在升级到 ' + job.tag + '：' : '') + job.stage
+      + (job.stage === '下载中' && job.total ? '（' + percent + '%）' : '') }));
+  }
+
+  const release = panel.release;
+  if (release) {
+    const cmp = compareVersions(release.version, panel.version);
+    rows.push(h('div', { class: 'muted small', text: '检查于 ' + timeAgo(release.checkedAt) + '（通过' + release.via + '）' }));
+    rows.push(h('div', { class: 'spread sub-item' },
+      h('div', {},
+        h('div', {}, '最新版 ' + release.tag + (cmp === 0 ? '（正在使用）' : cmp < 0 ? '（比现在的旧）' : '')),
+        h('div', { class: 'muted small' }, '发布于 ' + timeAgo(release.publishedAt) + ' · ',
+          h('a', { href: release.url, target: '_blank', rel: 'noopener noreferrer', text: '更新说明' }))),
+      cmp > 0 ? h('button', { class: 'primary small', disabled: busy || !panel.supported, text: '升级到 ' + release.tag,
+        onclick: (event) => {
+          if (!confirm('升级 sbpanel 到 ' + release.tag + '？\n\n下载优先走已启动的代理，按 SHA-256 校验。'
+            + '下载完面板会自动重启，代理会中断几秒钟；新版本启动失败会自动换回现在的版本。')) return;
+          act(event.currentTarget, async () => {
+            await api('POST', '/panel/install', { tag: release.tag });
+            rememberSwitch(release.tag);
+            await loadPanel();
+            schedulePanelPoll();
+          }, '开始下载，完成后面板会自动重启');
+        } }) : null));
+  }
+
+  if (panel.managed && panel.previous) {
+    rows.push(h('div', { class: 'row' },
+      h('button', { class: 'small', disabled: busy, text: '回退到 ' + panel.previous,
+        onclick: (event) => {
+          if (!confirm('换回 sbpanel ' + panel.previous + '？面板会重启，代理会中断几秒钟。')) return;
+          act(event.currentTarget, async () => {
+            await api('POST', '/panel/rollback');
+            rememberSwitch(panel.previous);
+            ui.panel.job = { running: true, stage: '重启中' };
+            renderPanelBody();
+            schedulePanelPoll();
+          }, null);
+        } })));
+  }
+  if (panel.lastError) rows.push(h('div', { class: 'sub-error', text: panel.lastError }));
+  if (job.error && !job.running) rows.push(h('div', { class: 'sub-error', text: '上次升级失败：' + job.error }));
+
+  card.replaceChildren(h('h2', { text: 'sbpanel 版本' }), ...rows);
 }
 
 function renderConfigCard() {
@@ -881,15 +981,9 @@ function renderConfigCard() {
 // ---------- start ----------
 
 async function boot() {
-  try {
-    const status = await api('GET', '/auth');
-    ui.loggedIn = status.loggedIn;
-  } catch (error) {
-    ui.loggedIn = false;
-    toast(error.message, true);
-  }
   render();
   await refresh();
+  reportSwitch();
   if (ui.tab === 'logs') refreshLogs();
   setInterval(() => {
     if (!document.hidden) refresh();

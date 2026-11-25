@@ -260,11 +260,6 @@ pre.log, pre.code {
 .empty h2 { color: var(--text); margin-bottom: 6px; }
 .empty p { margin: 0 0 14px; }
 
-/* ---------- login ---------- */
-
-.login { max-width: 360px; margin: 12vh auto 0; }
-.login .brand { justify-content: center; margin-bottom: 20px; }
-
 /* ---------- toasts ---------- */
 
 #toasts {

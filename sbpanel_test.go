@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"os/exec"
 	"strconv"
@@ -276,49 +275,6 @@ func TestGeneratedConfigPassesRealSingBoxCheck(t *testing.T) {
 	}
 	if !strings.Contains(string(built.JSON), "clash_api") {
 		t.Fatal("clash_api missing")
-	}
-}
-
-func TestPBKDF2KnownVector(t *testing.T) {
-	// RFC 7914 section 11 test vector for PBKDF2-HMAC-SHA256.
-	got := pbkdf2SHA256([]byte("passwd"), []byte("salt"), 1, 64)
-	want := "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783"
-	if hex.EncodeToString(got) != want {
-		t.Fatalf("pbkdf2 = %x", got)
-	}
-}
-
-func TestAuthSessionLifecycle(t *testing.T) {
-	auth := NewAuth(t.TempDir() + "/auth.json")
-	if err := auth.SetPassword("short"); err == nil {
-		t.Fatal("short password accepted")
-	}
-	if err := auth.SetPassword("correct horse"); err != nil {
-		t.Fatal(err)
-	}
-	if !auth.Verify("correct horse") || auth.Verify("wrong password") {
-		t.Fatal("verify mismatch")
-	}
-	now := time.Now()
-	token, err := auth.IssueSession(now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !auth.CheckSession(token, now) {
-		t.Fatal("fresh session rejected")
-	}
-	if auth.CheckSession(token, now.Add(sessionLifetime+time.Minute)) {
-		t.Fatal("expired session accepted")
-	}
-	if auth.CheckSession(token+"x", now) {
-		t.Fatal("tampered session accepted")
-	}
-	time.Sleep(10 * time.Millisecond) // make sure the file's mtime moves
-	if err := auth.SetPassword("another password"); err != nil {
-		t.Fatal(err)
-	}
-	if auth.CheckSession(token, now) {
-		t.Fatal("password change must sign out old sessions")
 	}
 }
 

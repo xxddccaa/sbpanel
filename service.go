@@ -136,7 +136,15 @@ func systemdUsable() bool {
 		return false
 	}
 	info, err := os.Stat("/run/systemd/system")
-	return err == nil && info.IsDir()
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	// Container images built from a full system can carry /run/systemd/system and
+	// systemctl while something else is process 1.
+	if comm, err := os.ReadFile("/proc/1/comm"); err == nil && strings.TrimSpace(string(comm)) != "systemd" {
+		return false
+	}
+	return true
 }
 
 // serviceManager runs the panel in the background: as a systemd service where
@@ -271,16 +279,81 @@ func (m directManager) Describe() string {
 
 // pid returns the running panel's process ID, or 0. The PID file alone is not
 // trusted: after a reboot or container restart the number may belong to anything.
+// When it does not lead to the panel (deleted, stale, or the panel was started by
+// hand with `nohup sbpanel serve &`), the process list is searched instead.
 func (m directManager) pid() int {
-	data, err := os.ReadFile(m.l.PIDFile)
-	if err != nil {
-		return 0
+	if data, err := os.ReadFile(m.l.PIDFile); err == nil {
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && pid > 0 && isServeProcess(pid) {
+			return pid
+		}
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || pid <= 0 || !isServeProcess(pid) {
-		return 0
+	return findServeProcess(m.l.DataDir)
+}
+
+// findServeProcess looks for a running `sbpanel serve` that uses dataDir. Of a
+// supervisor and its worker it returns the supervisor.
+func findServeProcess(dataDir string) int {
+	want := resolvedFile(dataDir)
+	entries, _ := os.ReadDir("/proc")
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid == os.Getpid() || !isServeProcess(pid) {
+			continue
+		}
+		if fields := procStat(pid); len(fields) > 1 {
+			if parent, err := strconv.Atoi(fields[1]); err == nil && isServeProcess(parent) {
+				continue
+			}
+		}
+		if dir := serveDataDir(pid); dir == "" || resolvedFile(dir) == want {
+			return pid
+		}
 	}
-	return pid
+	return 0
+}
+
+// serveDataDir works out the data directory of a running `sbpanel serve`: from
+// --data, then from the environment. "" means the process's own default, which is
+// the same as ours when it runs as the same user (other users' processes are
+// skipped).
+func serveDataDir(pid int) string {
+	args := procCmdline(pid)
+	for i := 2; i < len(args); i++ {
+		name, value, hasValue := strings.Cut(strings.TrimLeft(args[i], "-"), "=")
+		if name != "data" || !strings.HasPrefix(args[i], "-") {
+			continue
+		}
+		if !hasValue && i+1 < len(args) {
+			value = args[i+1]
+		}
+		return procPath(pid, value)
+	}
+	if environ, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid)); err == nil {
+		for _, variable := range strings.Split(string(environ), "\x00") {
+			for _, name := range []string{"SBPANEL_DATA=", "STATE_DIRECTORY="} {
+				if value, ok := strings.CutPrefix(variable, name); ok && value != "" {
+					return procPath(pid, value)
+				}
+			}
+		}
+	}
+	if info, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); err == nil {
+		if owner, ok := info.Sys().(*syscall.Stat_t); ok && int(owner.Uid) != os.Geteuid() {
+			return "/nonexistent" // another user's panel, with that user's own default
+		}
+	}
+	return ""
+}
+
+// procPath resolves a path a process was given relative to its working directory.
+func procPath(pid int, path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	if cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid)); err == nil {
+		return filepath.Join(cwd, path)
+	}
+	return path
 }
 
 func (m directManager) Start() error {
@@ -325,6 +398,8 @@ func (m directManager) Stop() error {
 	if pid := m.pid(); pid != 0 {
 		_ = syscall.Kill(pid, syscall.SIGTERM) // the panel stops sing-box itself
 		if !waitProcessExit(pid, directStopWait) {
+			// Start used setsid, so the process group holds the panel and its children.
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
 			_ = syscall.Kill(pid, syscall.SIGKILL)
 			waitProcessExit(pid, 3*time.Second)
 		}
@@ -560,19 +635,29 @@ func processStartTime(pid int) time.Time {
 	return bootTime().Add(time.Duration(ticks) * time.Second / clockTicks)
 }
 
-// processTreeRSS adds up the resident memory of pid and its direct children (sing-box).
+// processTreeRSS adds up the resident memory of pid and its descendants (the panel
+// worker and sing-box).
 func processTreeRSS(pid int) int64 {
-	total := processRSS(pid)
+	children := map[int][]int{}
 	entries, _ := os.ReadDir("/proc")
-	parent := strconv.Itoa(pid)
 	for _, entry := range entries {
 		child, err := strconv.Atoi(entry.Name())
 		if err != nil {
 			continue
 		}
-		if fields := procStat(child); len(fields) > 1 && fields[1] == parent {
-			total += processRSS(child)
+		if fields := procStat(child); len(fields) > 1 {
+			if parent, err := strconv.Atoi(fields[1]); err == nil {
+				children[parent] = append(children[parent], child)
+			}
 		}
+	}
+	var total int64
+	queue := []int{pid}
+	for len(queue) > 0 && len(queue) < 1000 {
+		current := queue[0]
+		queue = queue[1:]
+		total += processRSS(current)
+		queue = append(queue, children[current]...)
 	}
 	return total
 }

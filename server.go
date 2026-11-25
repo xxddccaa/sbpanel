@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -18,17 +19,16 @@ import (
 var webFiles embed.FS
 
 const (
-	sessionCookie   = "sbpanel_session"
 	csrfHeader      = "X-SBPanel"
 	maxRequestBytes = 1 << 20
 	actionTimeout   = 2 * time.Minute
 )
 
 type Server struct {
-	app     *App
-	auth    *Auth
-	limiter *loginLimiter
-	secure  bool // set the Secure cookie flag (panel served over HTTPS)
+	app *App
+	// Host names the panel answers to besides IP addresses and localhost
+	// (SBPANEL_ALLOWED_HOSTS). "*" turns the check off.
+	allowedHosts []string
 }
 
 func (s *Server) Handler() http.Handler {
@@ -40,12 +40,8 @@ func (s *Server) Handler() http.Handler {
 	}
 	mux.Handle("GET /", noCache(http.FileServer(http.FS(static))))
 
-	mux.HandleFunc("GET /api/auth", s.handleAuthStatus)
-	mux.HandleFunc("POST /api/login", s.handleLogin)
-	mux.HandleFunc("POST /api/logout", s.handleLogout)
-
-	protected := map[string]http.HandlerFunc{
-		"POST /api/password":                  s.handleChangePassword,
+	routes := map[string]http.HandlerFunc{
+		"GET /api/health":                     s.handleHealth,
 		"GET /api/state":                      s.handleState,
 		"POST /api/subscriptions":             s.handleAddSubscription,
 		"PUT /api/subscriptions/{id}":         s.handleEditSubscription,
@@ -63,12 +59,65 @@ func (s *Server) Handler() http.Handler {
 		"POST /api/kernel/install":            s.handleKernelInstall,
 		"POST /api/kernel/rollback":           s.handleKernelRollback,
 		"POST /api/kernel/use-system":         s.handleKernelUseSystem,
+		"GET /api/panel":                      s.handlePanel,
+		"POST /api/panel/check":               s.handlePanelCheck,
+		"POST /api/panel/install":             s.handlePanelInstall,
+		"POST /api/panel/rollback":            s.handlePanelRollback,
 		"GET /api/config":                     s.handleConfig,
 	}
-	for pattern, handler := range protected {
-		mux.Handle(pattern, s.requireSession(handler))
+	for pattern, handler := range routes {
+		mux.Handle(pattern, protectRequest(handler))
 	}
-	return securityHeaders(mux)
+	return securityHeaders(s.checkHost(mux))
+}
+
+// checkHost defends against DNS rebinding. The panel has no password, so without it
+// any web page could point its own domain at this server and use the panel as a
+// same-origin site. Browsers put the name they connected to in Host, so only IP
+// addresses, localhost and explicitly allowed names are served.
+func (s *Server) checkHost(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !hostAllowed(r.Host, s.allowedHosts) {
+			host := requestHostname(r.Host)
+			http.Error(w, "sbpanel 不接受用 "+host+" 访问（防止 DNS 重绑定攻击）。\n"+
+				"请用 IP 地址打开面板，或者在 sbpanel.env 里加一行 SBPANEL_ALLOWED_HOSTS="+host+" 后运行 sbpanel restart。",
+				http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func requestHostname(hostport string) string {
+	host := hostport
+	if parsed, _, err := net.SplitHostPort(hostport); err == nil {
+		host = parsed
+	}
+	return strings.ToLower(strings.TrimSuffix(strings.Trim(host, "[]"), "."))
+}
+
+func hostAllowed(hostport string, allowed []string) bool {
+	host := requestHostname(hostport)
+	if host == "" || net.ParseIP(host) != nil || host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	for _, name := range allowed {
+		if name == "*" || name == host {
+			return true
+		}
+	}
+	return false
+}
+
+// parseAllowedHosts reads a comma- or space-separated list of host names.
+func parseAllowedHosts(value string) []string {
+	var hosts []string
+	for _, field := range strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
+		if host := requestHostname(field); host != "" {
+			hosts = append(hosts, host)
+		}
+	}
+	return hosts
 }
 
 func securityHeaders(next http.Handler) http.Handler {
@@ -90,15 +139,20 @@ func noCache(next http.Handler) http.Handler {
 	})
 }
 
-// requireSession checks the session cookie. Mutating requests must also carry a custom
-// header, which a cross-site page cannot add without a CORS preflight we never allow.
-func (s *Server) requireSession(next http.HandlerFunc) http.Handler {
+func protectRequest(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.loggedIn(r) {
-			writeError(w, http.StatusUnauthorized, "请先登录")
+		if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+			writeError(w, http.StatusForbidden, "不允许跨站请求")
 			return
 		}
-		if r.Method != http.MethodGet && r.Header.Get(csrfHeader) != "1" {
+		if origin := r.Header.Get("Origin"); origin != "" {
+			parsed, err := url.Parse(origin)
+			if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || !strings.EqualFold(parsed.Host, r.Host) {
+				writeError(w, http.StatusForbidden, "不允许跨站请求")
+				return
+			}
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Header.Get(csrfHeader) != "1" {
 			writeError(w, http.StatusForbidden, "请求缺少校验头")
 			return
 		}
@@ -106,84 +160,8 @@ func (s *Server) requireSession(next http.HandlerFunc) http.Handler {
 	})
 }
 
-func (s *Server) loggedIn(r *http.Request) bool {
-	cookie, err := r.Cookie(sessionCookie)
-	return err == nil && s.auth.CheckSession(cookie.Value, time.Now())
-}
-
-func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]bool{"loggedIn": s.loggedIn(r)})
-}
-
-func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get(csrfHeader) != "1" {
-		writeError(w, http.StatusForbidden, "请求缺少校验头")
-		return
-	}
-	client := clientAddress(r)
-	now := time.Now()
-	if wait := s.limiter.blockedFor(client, now); wait > 0 {
-		writeError(w, http.StatusTooManyRequests, "密码错误次数太多，请 "+wait.Round(time.Second).String()+" 后再试")
-		return
-	}
-	var body struct {
-		Password string `json:"password"`
-	}
-	if !readJSON(w, r, &body) {
-		return
-	}
-	ok := s.auth.Verify(body.Password)
-	s.limiter.record(client, ok, now)
-	if !ok {
-		time.Sleep(500 * time.Millisecond)
-		writeError(w, http.StatusUnauthorized, "密码不对")
-		return
-	}
-	token, err := s.auth.IssueSession(now)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	http.SetCookie(w, &http.Cookie{
-		Name: sessionCookie, Value: token, Path: "/", HttpOnly: true, Secure: s.secure,
-		SameSite: http.SameSiteStrictMode, MaxAge: int(sessionLifetime.Seconds()),
-	})
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
-func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{
-		Name: sessionCookie, Value: "", Path: "/", HttpOnly: true, Secure: s.secure,
-		SameSite: http.SameSiteStrictMode, MaxAge: -1,
-	})
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
-func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Current string `json:"current"`
-		New     string `json:"new"`
-	}
-	if !readJSON(w, r, &body) {
-		return
-	}
-	if !s.auth.Verify(body.Current) {
-		writeError(w, http.StatusBadRequest, "当前密码不对")
-		return
-	}
-	if err := s.auth.SetPassword(body.New); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	// Changing the password rotates the session key; give this browser a fresh session.
-	token, err := s.auth.IssueSession(time.Now())
-	if err == nil {
-		http.SetCookie(w, &http.Cookie{
-			Name: sessionCookie, Value: token, Path: "/", HttpOnly: true, Secure: s.secure,
-			SameSite: http.SameSiteStrictMode, MaxAge: int(sessionLifetime.Seconds()),
-		})
-	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": version})
 }
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
@@ -336,6 +314,34 @@ func (s *Server) handleKernelUseSystem(w http.ResponseWriter, r *http.Request) {
 	respond(w, s.app.UseSystemKernel(ctx))
 }
 
+func (s *Server) handlePanel(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.app.panel.View())
+}
+
+func (s *Server) handlePanelCheck(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := actionContext(r)
+	defer cancel()
+	if err := s.app.CheckPanelRelease(ctx); err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.app.panel.View())
+}
+
+func (s *Server) handlePanelInstall(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Tag string `json:"tag"`
+	}
+	if !readJSON(w, r, &body) {
+		return
+	}
+	respond(w, s.app.StartPanelInstall(body.Tag))
+}
+
+func (s *Server) handlePanelRollback(w http.ResponseWriter, r *http.Request) {
+	respond(w, s.app.RollbackPanel())
+}
+
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	data, err := s.app.GeneratedConfig()
 	if err != nil {
@@ -382,12 +388,4 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
-}
-
-func clientAddress(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }

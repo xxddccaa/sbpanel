@@ -2,6 +2,20 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.3.0] - 2026-11-25
+
+### 变化
+- **网页面板不再需要密码**，打开地址直接用。去掉了 `sbpanel passwd` 命令和菜单里的“重设面板密码”。面板没有密码，请只在可信网络里开放，公网服务器上建议只监听本机再用 SSH 隧道访问
+- 为了防 DNS 重绑定，面板只接受用 IP 地址或 `localhost` 访问；用域名访问时在 `sbpanel.env` 里设置 `SBPANEL_ALLOWED_HOSTS`。`SBPANEL_SECURE_COOKIE` 不再需要
+
+### 新功能
+- 在网页里升级 sbpanel（“设置 → sbpanel 版本”）：优先通过已启动的代理下载，SHA-256 校验，自动重启到新版本；新版本没能启动会自动换回原来的版本；可以一键回退。从 v0.2.x 升级需要先运行一次 `sbpanel update`
+
+### 修复
+- 后台进程方式运行时，PID 文件丢失或不对（比如面板是手动 `nohup sbpanel serve &` 启动的），`status`、菜单会误报“已停止”，重新安装会误报端口被占用。现在会在进程列表里找到正在运行的面板
+- 镜像里带着 systemd 但 systemd 并没有作为 1 号进程运行的容器，不再先尝试 systemd 再失败
+- 普通用户安装后提示怎样把 `~/.local/bin` 加到 PATH，给出可以直接复制的命令
+
 ## [v0.2.1] - 2026-11-18
 
 ### 修复

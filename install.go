@@ -122,22 +122,13 @@ func runInstall(args []string) error {
 	if err := writeListenToEnvFile(l.EnvFile, listen); err != nil {
 		return err
 	}
-	freshAuth := !fileExists(filepath.Join(l.DataDir, "auth.json"))
-
 	manager, err := startInstalled(l, listen)
 	if err != nil {
 		return err
 	}
 
 	reportCore(l)
-	password := ""
-	if freshAuth {
-		password = randomPassword(12)
-		if err := setPanelPassword(l.DataDir, password); err != nil {
-			return err
-		}
-	}
-	printInstallSummary(l, manager, listen, upgrading, password)
+	printInstallSummary(l, manager, listen, upgrading)
 	return nil
 }
 
@@ -235,7 +226,7 @@ func removeUnit() {
 	}
 }
 
-func printInstallSummary(l layout, manager serviceManager, listen string, upgrading bool, password string) {
+func printInstallSummary(l layout, manager serviceManager, listen string, upgrading bool) {
 	fmt.Println()
 	verb := "已安装并启动"
 	if upgrading {
@@ -251,11 +242,7 @@ func printInstallSummary(l layout, manager serviceManager, listen string, upgrad
 		}
 		row(label, colorBold(link))
 	}
-	if password != "" {
-		row("登录密码", colorBold(password)+"  "+colorDim("（请记下来；忘了运行 sbpanel passwd 重设）"))
-	} else {
-		row("登录密码", colorDim("没有改变（忘了运行 sbpanel passwd 重设）"))
-	}
+	row("访问方式", "免密码，直接打开（仅限可信网络，勿直接暴露到公网）")
 	command := "sbpanel"
 	if !l.System && !onPath(filepath.Dir(l.Binary)) {
 		command = l.Binary
@@ -267,7 +254,9 @@ func printInstallSummary(l layout, manager serviceManager, listen string, upgrad
 		row("开机自启", "已开启")
 	}
 	if !l.System && command != "sbpanel" {
-		fmt.Println(colorDim("  想直接输入 sbpanel：把 " + filepath.Dir(l.Binary) + " 加到 PATH"))
+		dir := filepath.Dir(l.Binary)
+		fmt.Println(colorDim("  " + dir + " 不在 PATH 里，所以现在要输入完整路径。想直接输入 sbpanel，运行："))
+		fmt.Println(colorDim("  echo 'export PATH=\"" + dir + ":$PATH\"' >> ~/.bashrc && export PATH=\"" + dir + ":$PATH\""))
 	}
 	if host, port, _ := net.SplitHostPort(listen); net.ParseIP(host).IsUnspecified() {
 		local := "127.0.0.1:" + port
@@ -323,19 +312,6 @@ func installSelf(l layout) error {
 		return err
 	}
 	printStep("已安装到 %s", l.Binary)
-	return nil
-}
-
-func setPanelPassword(dataDir, password string) error {
-	if err := os.MkdirAll(dataDir, 0o700); err != nil {
-		return err
-	}
-	authPath := filepath.Join(dataDir, "auth.json")
-	if err := NewAuth(authPath).SetPassword(password); err != nil {
-		return err
-	}
-	// When root writes into the service's DynamicUser-owned directory, hand it back.
-	chownLike(authPath, dataDir)
 	return nil
 }
 
@@ -602,7 +578,7 @@ func compareSemver(a, b string) int {
 
 func runUninstall(args []string) error {
 	flags := flag.NewFlagSet("uninstall", flag.ExitOnError)
-	purge := flags.Bool("purge", false, "同时删除订阅、设置、面板密码和面板安装的 sing-box")
+	purge := flags.Bool("purge", false, "同时删除订阅、设置和面板安装的程序")
 	yes := flags.Bool("y", false, "不再确认")
 	flags.Parse(args)
 	l := currentLayout()
@@ -649,7 +625,7 @@ func uninstall(l layout, purge bool) error {
 		if logDir := filepath.Dir(l.LogFile); l.System && fileExists(l.LogFile) {
 			kept = append(kept, logDir)
 		}
-		fmt.Println(colorDim("  订阅、设置和面板密码保留了下来，重新安装后会继续使用。要彻底删除，运行："))
+		fmt.Println(colorDim("  订阅和设置保留了下来，重新安装后会继续使用。要彻底删除，运行："))
 		fmt.Println(colorDim("  rm -rf " + strings.Join(kept, " ")))
 	}
 	return nil

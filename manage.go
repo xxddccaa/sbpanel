@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -139,8 +140,11 @@ func validateListen(address string) error {
 const envFileHeader = `# sbpanel 服务设置。修改后运行 sbpanel restart 生效。
 #
 # 网页面板监听地址：
-#   0.0.0.0:8091    局域网和公网都能访问（面板有密码，但走的是明文 HTTP）
+#   0.0.0.0:8091    局域网和公网都能访问（面板没有密码，公网服务器上不要这样用）
 #   127.0.0.1:8091  只有本机能访问，远程用 SSH 隧道：ssh -L 8091:127.0.0.1:8091 用户@服务器
+#
+# 用域名访问面板（比如在前面加了 nginx、Caddy 反向代理）时，把域名加到这里，逗号分隔：
+#   SBPANEL_ALLOWED_HOSTS=panel.example.com
 `
 
 // writeListenToEnvFile rewrites SBPANEL_LISTEN and keeps any other lines the user added.
@@ -229,14 +233,41 @@ func waitForPanel(listen string, timeout time.Duration) bool {
 	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil}}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		response, err := client.Get("http://" + net.JoinHostPort(host, port) + "/api/auth")
+		response, err := client.Get("http://" + net.JoinHostPort(host, port) + "/api/health")
 		if err == nil {
 			response.Body.Close()
-			return true
+			if response.StatusCode == http.StatusOK {
+				return true
+			}
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
 	return false
+}
+
+// runningPanelVersion asks the running panel for its version, which differs from
+// this program's after an upgrade from the web panel.
+func runningPanelVersion(listen string) string {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return ""
+	}
+	if ip := net.ParseIP(host); ip == nil || ip.IsUnspecified() {
+		host = "127.0.0.1"
+	}
+	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	response, err := client.Get("http://" + net.JoinHostPort(host, port) + "/api/health")
+	if err != nil {
+		return ""
+	}
+	defer response.Body.Close()
+	var health struct {
+		Version string `json:"version"`
+	}
+	if response.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&health) != nil {
+		return ""
+	}
+	return health.Version
 }
 
 // waitForCore waits for the proxy after the panel came up, when the proxy is meant to
@@ -335,6 +366,9 @@ func printStatus(l layout) {
 	manager := managerFor(l)
 	status := manager.Status()
 	row("服务", describeService(status))
+	if running := runningPanelVersion(l.panelListen()); status.Running && running != "" && running != version {
+		row("面板版本", running+colorDim("（在网页里升级的；命令行程序是 "+version+"）"))
+	}
 	row("运行方式", manager.Describe())
 	row("开机自启", describeAutostart(manager))
 
@@ -641,10 +675,9 @@ func runMenu() error {
 		fmt.Println("   2. 启动              3. 停止              4. 重启")
 		fmt.Println("   5. " + autostart)
 		fmt.Println("   6. 查看最近日志      7. 持续查看日志（Ctrl+C 返回）")
-		fmt.Println("   8. 重设面板密码")
-		fmt.Println("   9. 修改面板地址/端口")
-		fmt.Println("  10. 更新 sbpanel")
-		fmt.Println("  11. 卸载")
+		fmt.Println("   8. 修改面板地址/端口")
+		fmt.Println("   9. 更新 sbpanel")
+		fmt.Println("  10. 卸载")
 		fmt.Println("   0. 退出")
 
 		switch ask("\n请选择: ") {
@@ -676,31 +709,17 @@ func runMenu() error {
 		case "7":
 			report(manager.Logs(true, 30))
 		case "8":
-			password := readSecret("新密码（至少 8 位，直接回车随机生成）: ")
-			generated := password == ""
-			if generated {
-				password = randomPassword(12)
-			}
-			if err := setPanelPassword(l.DataDir, password); err != nil {
-				report(err)
-			} else if generated {
-				printOK("新密码: %s", colorBold(password))
-			} else {
-				printOK("密码已更新")
-			}
-			pause()
-		case "9":
 			fmt.Println("  当前: " + l.panelListen())
 			fmt.Println(colorDim("  可以只填端口（如 8092），或者 IP:端口。127.0.0.1:8091 表示只允许本机访问。"))
 			if answer := ask("  新地址（直接回车取消）: "); answer != "" {
 				report(changePanelListen(l, answer))
 				pause()
 			}
-		case "10":
+		case "9":
 			report(runUpdate(nil))
 			pause()
-		case "11":
-			fmt.Println("  卸载会删除服务和程序。订阅、设置和面板密码默认保留，重新安装后还能用。")
+		case "10":
+			fmt.Println("  卸载会删除服务和程序。订阅和设置默认保留，重新安装后还能用。")
 			switch ask("  确定卸载吗？[y/N/purge（连数据一起删）] ") {
 			case "y", "Y":
 				report(uninstall(l, false))

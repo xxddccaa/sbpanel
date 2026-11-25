@@ -15,7 +15,7 @@ v2rayN 这类客户端需要图形界面。sbpanel 把它们最常用的几项�
 
 - **一个可执行文件**：Go 编写，只用标准库，网页打包在程序里，没有其他依赖
 - **一行命令安装**：有 systemd 就注册成服务并开机自启；容器、Kubernetes、没有 root 的环境也能装，改用后台进程运行；没装 sing-box 的话顺便装上
-- **终端里也能管**：`sbpanel` 打开管理菜单，可以查看状态、启停服务、看日志、改密码、更新、卸载
+- **终端里也能管**：`sbpanel` 打开管理菜单，可以查看状态、启停服务、看日志、更新、卸载
 
 ## 安装
 
@@ -23,13 +23,13 @@ v2rayN 这类客户端需要图形界面。sbpanel 把它们最常用的几项�
 bash <(curl -fsSL https://raw.githubusercontent.com/xxddccaa/sbpanel/main/install.sh)
 ```
 
-安装完会打印面板地址和登录密码：
+安装完会打印面板地址，浏览器直接打开就能用，不需要密码：
 
 ```
 ✓ sbpanel v0.2.0 已安装并启动
   运行方式  systemd 服务
   网页面板  http://192.168.1.10:8091
-  登录密码  Xk7mP2qRtW9a  （请记下来；忘了运行 sbpanel passwd 重设）
+  访问方式  免密码，直接打开（仅限可信网络，勿直接暴露到公网）
   管理命令  sbpanel（打开管理菜单）
   开机自启  已开启
 ```
@@ -51,7 +51,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xxddccaa/sbpanel/main/instal
 
 ## 使用
 
-1. 浏览器打开安装时打印的面板地址，用打印出来的密码登录。
+1. 浏览器打开安装时打印的面板地址。
 2. **订阅** → **添加订阅**，粘贴订阅地址。
 3. 点 **启动代理**。
 4. **节点** 页：点一下切换节点，或者选“自动选择”，也可以全部测速。
@@ -88,6 +88,19 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xxddccaa/sbpanel/main/instal
 
 面板安装的内核放在 `/var/lib/sbpanel/kernel/`，不会改动系统里的 sing-box。随时可以回退到上一个版本，或改回系统自带的版本。
 
+### 升级 sbpanel
+
+“设置 → sbpanel 版本”可以检查和安装新版本，不用登录服务器：
+
+1. 只在你点“检查更新”时访问 GitHub。**优先通过已经启动的代理下载**，代理不通再直连，所以服务器直连不了 GitHub 也能升级
+2. 下载官方发布包，按 SHA-256 校验
+3. 面板自动重启到新版本，代理会中断几秒钟。新版本 90 秒内没有正常启动，会自动换回原来的版本，并在网页上显示原因
+4. 随时可以点“回退”换回上一个版本
+
+原理：面板服务不能改写 `/usr/local/bin/sbpanel`（systemd 下它以临时用户运行，系统目录只读）。所以 `sbpanel serve` 是一个很小的主进程，真正的面板是它的子进程。网页里下载的新版本放在数据目录的 `panel/` 下，主进程发现它比自己新，就改为运行它。以后用 `sbpanel update` 装了更新的版本，会自动改用那个。
+
+这个功能从 v0.3.0 开始有。还在用 v0.2.x 的，先在服务器上运行一次 `sbpanel update`。
+
 <p align="center"><img src="docs/screenshots/settings.png" width="70%" alt="设置页"></p>
 
 ## 终端管理
@@ -105,10 +118,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xxddccaa/sbpanel/main/instal
    2. 启动              3. 停止              4. 重启
    5. 关闭开机自启
    6. 查看最近日志      7. 持续查看日志（Ctrl+C 返回）
-   8. 重设面板密码
-   9. 修改面板地址/端口
-  10. 更新 sbpanel
-  11. 卸载
+   8. 修改面板地址/端口
+   9. 更新 sbpanel
+  10. 卸载
    0. 退出
 ```
 
@@ -120,10 +132,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xxddccaa/sbpanel/main/instal
 | `sbpanel start` / `stop` / `restart` | 启动、停止、重启（停止时代理也会一起停） |
 | `sbpanel enable` / `disable` | 开启、关闭开机自启（只有 systemd 服务方式支持） |
 | `sbpanel logs [-f]` | 查看日志，`-f` 持续输出（systemd 方式读 journald，后台进程方式读日志文件） |
-| `sbpanel passwd` | 重设面板密码（直接回车随机生成） |
 | `sbpanel listen 127.0.0.1:8091` | 修改面板监听地址；只写端口也行，比如 `sbpanel listen 8092` |
-| `sbpanel update` | 更新到最新版本 |
-| `sbpanel uninstall [--purge]` | 卸载；默认保留订阅、设置和面板密码，重新安装后继续使用；加 `--purge` 一起删除 |
+| `sbpanel update` | 更新到最新版本（也可以在网页面板里升级，见下文） |
+| `sbpanel uninstall [--purge]` | 卸载；默认保留订阅和设置，重新安装后继续使用；加 `--purge` 一起删除 |
 
 `sbpanel status` 的输出示例：
 
@@ -143,7 +154,9 @@ sbpanel v0.2.0
 
 ## 安全
 
-- 面板要用密码登录。密码用 PBKDF2 加盐哈希保存；登录凭证放在 HttpOnly、SameSite=Strict 的 Cookie 里；修改类请求有 CSRF 防护；连续输错 5 次密码锁定 1 分钟。
+- **面板没有密码**，能访问面板端口的人都能操作它（包括看到订阅地址和节点密码）。只在可信的局域网里开放，或者按下面的方法只监听本机。
+- 修改类请求有 CSRF 防护，跨站请求会被拒绝。
+- 防 DNS 重绑定：只接受用 IP 地址或 `localhost` 打开面板。用域名访问（比如前面加了反向代理）时，在 `sbpanel.env` 里加上 `SBPANEL_ALLOWED_HOSTS=panel.example.com`（多个用逗号分隔），然后 `sbpanel restart`。
 - 用 systemd 运行时，服务以临时用户（`DynamicUser`）身份运行，不需要 root，也不能改动系统文件。少数系统不支持这些沙箱选项，会自动改用普通的 systemd 服务。
 - **面板走的是明文 HTTP。** 默认监听 `0.0.0.0:8091`，方便在局域网里用。在公网服务器上，建议只监听本机，再用 SSH 隧道访问：
 
@@ -154,7 +167,7 @@ sbpanel v0.2.0
   # 然后浏览器打开 http://127.0.0.1:8091
   ```
 
-  也可以在前面加一层 HTTPS 反向代理（nginx、Caddy），并在 `/etc/sbpanel/sbpanel.env` 里加上 `SBPANEL_SECURE_COOKIE=1`。
+  也可以在前面加一层带认证的 HTTPS 反向代理（nginx、Caddy），记得把域名加到 `SBPANEL_ALLOWED_HOSTS`。
 
 ## 目前的限制
 
@@ -171,7 +184,7 @@ sbpanel v0.2.0
 |-----------|--------------|------|
 | `/usr/local/bin/sbpanel` | `~/.local/bin/sbpanel` | 程序（安装时下载的 sing-box 也放在这里） |
 | `/etc/sbpanel/sbpanel.env` | `~/.config/sbpanel/sbpanel.env` | 服务设置（面板监听地址等） |
-| `/var/lib/sbpanel/` | `~/.local/share/sbpanel/` | 订阅、设置、面板密码、生成的 sing-box 配置、规则文件、面板安装的内核 |
+| `/var/lib/sbpanel/` | `~/.local/share/sbpanel/` | 订阅、设置、生成的 sing-box 配置、规则文件、面板安装的内核和 sbpanel |
 | journald | `~/.local/share/sbpanel/sbpanel.log` | 日志（root 用后台进程方式时在 `/var/log/sbpanel/sbpanel.log`） |
 | `/etc/systemd/system/sbpanel.service` | — | systemd 服务（只有 systemd 方式才有） |
 
@@ -203,7 +216,7 @@ make dist        # 交叉编译所有架构，输出到 dist/
 | `rules.go` | “绕过大陆”的规则文件 |
 | `kernel.go` | sing-box 内核：查版本、下载校验、切换、回退 |
 | `core.go` | sing-box 子进程管理、日志缓冲、clash API |
-| `auth.go` | 密码哈希、会话、登录限速 |
+| `panel.go` | 在网页里升级 sbpanel：主进程（守护）与面板子进程、下载校验、试运行和回退 |
 | `server.go` | HTTP 接口 |
 | `store.go` | 状态保存（原子写入） |
 | `transfer.go` | 下载工具：先走代理再直连 |

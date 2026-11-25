@@ -36,6 +36,7 @@ type App struct {
 	checker    Checker
 	configPath string
 	kernel     *Kernel
+	panel      *PanelUpdater
 	ruleSetDir string
 	tempDir    string
 
