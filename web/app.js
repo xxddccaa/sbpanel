@@ -892,7 +892,7 @@ function renderPanelBody() {
         h('div', { class: 'status-node', text: 'sbpanel ' + panel.version }),
         h('div', { class: 'muted small', text: panel.managed ? '在网页里升级的版本（安装时是 ' + panel.baseVersion + '）' : '安装时的版本' })),
       h('button', { text: '检查更新', disabled: busy || !panel.supported,
-        title: '只在你点的时候访问 GitHub，优先走已启动的代理',
+        title: '只在你点的时候访问 GitHub（不用 API，没有次数限制），优先走已启动的代理',
         onclick: async (event) => {
           await act(event.currentTarget, async () => { ui.panel = await api('POST', '/panel/check'); }, null);
           renderPanelBody();
@@ -916,8 +916,8 @@ function renderPanelBody() {
     rows.push(h('div', { class: 'spread sub-item' },
       h('div', {},
         h('div', {}, '最新版 ' + release.tag + (cmp === 0 ? '（正在使用）' : cmp < 0 ? '（比现在的旧）' : '')),
-        h('div', { class: 'muted small' }, '发布于 ' + timeAgo(release.publishedAt) + ' · ',
-          h('a', { href: release.url, target: '_blank', rel: 'noopener noreferrer', text: '更新说明' }))),
+        h('div', { class: 'muted small' },
+          h('a', { href: release.url, target: '_blank', rel: 'noopener noreferrer', text: '查看更新说明' }))),
       cmp > 0 ? h('button', { class: 'primary small', disabled: busy || !panel.supported, text: '升级到 ' + release.tag,
         onclick: (event) => {
           if (!confirm('升级 sbpanel 到 ' + release.tag + '？\n\n下载优先走已启动的代理，按 SHA-256 校验。'

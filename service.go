@@ -290,10 +290,35 @@ func (m directManager) pid() int {
 	return findServeProcess(m.l.DataDir)
 }
 
-// findServeProcess looks for a running `sbpanel serve` that uses dataDir. Of a
-// supervisor and its worker it returns the supervisor.
-func findServeProcess(dataDir string) int {
-	want := resolvedFile(dataDir)
+// runningPanel is a `sbpanel serve` found in the process list: one started by
+// sbpanel itself, by systemd, or by hand (`nohup sbpanel serve &`).
+type runningPanel struct {
+	PID       int
+	DataDir   string // from --data or the environment; "" means the default
+	Listen    string // likewise for the panel address
+	OtherUser bool   // runs as someone else, so its default data directory is not ours
+}
+
+// uses reports whether the panel manages dataDir. A panel started without a data
+// directory uses the default, which is ours when it runs as the same user.
+func (p runningPanel) uses(dataDir string) bool {
+	if p.DataDir == "" {
+		return !p.OtherUser && resolvedDir(dataDir) == resolvedDir(defaultDataDir())
+	}
+	return resolvedDir(p.DataDir) == resolvedDir(dataDir)
+}
+
+func (p runningPanel) listenAddress() string {
+	if p.Listen == "" {
+		return defaultPanelListen
+	}
+	return p.Listen
+}
+
+// runningPanels lists the running panels. Of a supervisor and its worker only the
+// supervisor is listed.
+func runningPanels() []runningPanel {
+	var panels []runningPanel
 	entries, _ := os.ReadDir("/proc")
 	for _, entry := range entries {
 		pid, err := strconv.Atoi(entry.Name())
@@ -305,44 +330,73 @@ func findServeProcess(dataDir string) int {
 				continue
 			}
 		}
-		if dir := serveDataDir(pid); dir == "" || resolvedFile(dir) == want {
-			return pid
+		panel := runningPanel{PID: pid}
+		if dir := serveSetting(pid, "data", "SBPANEL_DATA", "STATE_DIRECTORY"); dir != "" {
+			panel.DataDir = procPath(pid, dir)
 		}
+		panel.Listen = serveSetting(pid, "listen", "SBPANEL_LISTEN")
+		if info, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); err == nil {
+			if owner, ok := info.Sys().(*syscall.Stat_t); ok && int(owner.Uid) != os.Geteuid() {
+				panel.OtherUser = true
+			}
+		}
+		panels = append(panels, panel)
+	}
+	return panels
+}
+
+// findRunningPanel returns the running panel that manages dataDir, if any.
+func findRunningPanel(dataDir string) *runningPanel {
+	for _, panel := range runningPanels() {
+		if panel.uses(dataDir) {
+			return &panel
+		}
+	}
+	return nil
+}
+
+func findServeProcess(dataDir string) int {
+	if panel := findRunningPanel(dataDir); panel != nil {
+		return panel.PID
 	}
 	return 0
 }
 
-// serveDataDir works out the data directory of a running `sbpanel serve`: from
-// --data, then from the environment. "" means the process's own default, which is
-// the same as ours when it runs as the same user (other users' processes are
-// skipped).
-func serveDataDir(pid int) string {
+// serveSetting reads a `sbpanel serve` option from its command line (--flag value or
+// --flag=value), then from its environment, the same order serve itself uses.
+func serveSetting(pid int, flagName string, envNames ...string) string {
 	args := procCmdline(pid)
 	for i := 2; i < len(args); i++ {
+		if !strings.HasPrefix(args[i], "-") {
+			continue
+		}
 		name, value, hasValue := strings.Cut(strings.TrimLeft(args[i], "-"), "=")
-		if name != "data" || !strings.HasPrefix(args[i], "-") {
+		if name != flagName {
 			continue
 		}
 		if !hasValue && i+1 < len(args) {
 			value = args[i+1]
 		}
-		return procPath(pid, value)
+		return value
 	}
 	if environ, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid)); err == nil {
-		for _, variable := range strings.Split(string(environ), "\x00") {
-			for _, name := range []string{"SBPANEL_DATA=", "STATE_DIRECTORY="} {
-				if value, ok := strings.CutPrefix(variable, name); ok && value != "" {
-					return procPath(pid, value)
+		for _, name := range envNames {
+			for _, variable := range strings.Split(string(environ), "\x00") {
+				if value, ok := strings.CutPrefix(variable, name+"="); ok && strings.TrimSpace(value) != "" {
+					return strings.TrimSpace(value)
 				}
 			}
 		}
 	}
-	if info, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); err == nil {
-		if owner, ok := info.Sys().(*syscall.Stat_t); ok && int(owner.Uid) != os.Geteuid() {
-			return "/nonexistent" // another user's panel, with that user's own default
-		}
-	}
 	return ""
+}
+
+// resolvedDir resolves symlinks in a directory path, also when it does not exist.
+func resolvedDir(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	return resolvedFile(path)
 }
 
 // procPath resolves a path a process was given relative to its working directory.

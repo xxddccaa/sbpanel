@@ -360,7 +360,11 @@ func printStatus(l layout) {
 	fmt.Println(colorBold("sbpanel " + version))
 	row := func(label, value string) { fmt.Printf("  %s  %s\n", padDisplay(label, 8), value) }
 	if !l.installed() {
-		row("服务", colorDim("● 未安装")+"（运行 sbpanel install 安装）")
+		if pid := findServeProcess(l.DataDir); pid != 0 {
+			row("服务", colorGreen("● 运行中")+colorDim(fmt.Sprintf("（PID %d，手动启动的，没有安装成服务；运行 sbpanel install 接管）", pid)))
+		} else {
+			row("服务", colorDim("● 未安装")+"（运行 sbpanel install 安装）")
+		}
 		return
 	}
 	manager := managerFor(l)

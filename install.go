@@ -133,9 +133,14 @@ func runInstall(args []string) error {
 }
 
 // chooseListen keeps the configured panel address unless asked to change it, and
-// makes sure the port is free (or already ours).
+// makes sure the port is free or held by the panel this install replaces.
 func chooseListen(l layout, listenFlag string, portFlag int) (string, error) {
 	listen := l.panelListen()
+	running := findRunningPanel(l.DataDir)
+	if running != nil && !fileExists(l.EnvFile) {
+		// Started by hand before sbpanel could run without systemd: keep its address.
+		listen = running.listenAddress()
+	}
 	if listenFlag != "" {
 		listen = listenFlag
 	}
@@ -149,11 +154,41 @@ func chooseListen(l layout, listenFlag string, portFlag int) (string, error) {
 	if err := validateListen(listen); err != nil {
 		return "", err
 	}
-	ours := l.installed() && managerFor(l).Status().Running && listen == l.panelListen()
+	// startInstalled stops that panel before starting the new one.
+	ours := running != nil && samePort(running.listenAddress(), listen)
 	if !ours && !canListen(listen) {
+		for _, other := range runningPanels() {
+			if !other.uses(l.DataDir) && samePort(other.listenAddress(), listen) {
+				return "", otherPanelError(l, other, listen)
+			}
+		}
 		return "", fmt.Errorf("面板端口 %s 已经被别的程序占用了，换一个：sbpanel install --port 8092", listen)
 	}
+	if running != nil && !l.installed() {
+		printStep("发现手动运行的 sbpanel（PID %d），换成新安装的服务", running.PID)
+	}
 	return listen, nil
+}
+
+func samePort(a, b string) bool {
+	_, portA, errA := net.SplitHostPort(a)
+	_, portB, errB := net.SplitHostPort(b)
+	return errA == nil && errB == nil && portA == portB
+}
+
+func otherPanelError(l layout, other runningPanel, listen string) error {
+	owner := "另一个 sbpanel"
+	if other.OtherUser {
+		owner = "另一个用户运行的 sbpanel"
+	}
+	dir := other.DataDir
+	if dir == "" {
+		dir = "它的默认目录"
+	}
+	return fmt.Errorf("面板端口 %s 被%s占用了（PID %d，数据目录 %s，和这次安装用的 %s 不同）。\n"+
+		"  要继续用它的订阅和设置：先停掉它（kill %d），把 %s 里的文件复制到 %s，再重新安装。\n"+
+		"  或者换一个端口安装：sbpanel install --port 8092",
+		listen, owner, other.PID, dir, l.DataDir, other.PID, dir, l.DataDir)
 }
 
 // startInstalled (re)starts the panel with whatever this machine supports, falling
@@ -399,7 +434,15 @@ func cliDownloadAsset(ctx context.Context, asset *githubAsset, dir string, sums 
 			return downloadVerified(response.Body, path, want, func(done int64) {
 				if useColor && time.Since(lastPrint) > 500*time.Millisecond {
 					lastPrint = time.Now()
-					fmt.Printf("\r  下载 %s  %.1f / %.1f MB ", asset.Name, float64(done)/(1<<20), float64(asset.Size)/(1<<20))
+					size := asset.Size
+					if size == 0 {
+						size = response.ContentLength
+					}
+					if size > 0 {
+						fmt.Printf("\r  下载 %s  %.1f / %.1f MB ", asset.Name, float64(done)/(1<<20), float64(size)/(1<<20))
+					} else {
+						fmt.Printf("\r  下载 %s  %.1f MB ", asset.Name, float64(done)/(1<<20))
+					}
 				}
 			})
 		})
@@ -476,20 +519,25 @@ func runUpdate(args []string) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), cliDownloadTimeout)
 	defer cancel()
-	printStep("检查新版本…")
-	release, err := cliGitHubRelease(ctx, githubRepo, *tag)
-	if err != nil {
-		return err
+	fetch := func(ctx context.Context, rawURL string, header http.Header, timeout time.Duration, consume func(*http.Response) error) (string, error) {
+		return "", cliGet(ctx, rawURL, header, timeout, consume)
 	}
-	if !*force && *tag == "" && compareSemver(release.TagName, version) <= 0 {
-		printOK("已经是最新版本 %s", version)
-		return nil
+	target := *tag
+	if target == "" {
+		printStep("检查新版本…")
+		latest, _, err := latestSbpanelTag(ctx, fetch)
+		if err != nil {
+			return fmt.Errorf("%w（访问不了 GitHub 的话，可以设置 HTTPS_PROXY 或 GH_PROXY 再试）", err)
+		}
+		if !*force && compareSemver(latest, version) <= 0 {
+			printOK("已经是最新版本 %s", version)
+			return nil
+		}
+		target = latest
+	} else if !releaseTagPattern.MatchString(target) {
+		return fmt.Errorf("版本号格式不对: %s（例如 v0.3.0）", target)
 	}
-	assetName, err := sbpanelAssetName()
-	if err != nil {
-		return err
-	}
-	asset, err := findAsset(release, assetName)
+	asset, err := sbpanelReleaseAsset(ctx, fetch, target)
 	if err != nil {
 		return err
 	}
@@ -498,18 +546,8 @@ func runUpdate(args []string) error {
 		return err
 	}
 	defer os.RemoveAll(dir)
-	sums := map[string]string{}
-	if sumsAsset, err := findAsset(release, "sha256sums.txt"); err == nil {
-		_ = cliGet(ctx, sumsAsset.BrowserDownloadURL, nil, cliAPITimeout, func(response *http.Response) error {
-			data, err := readLimited(response.Body, 1<<20)
-			if err == nil {
-				sums = parseSHA256Sums(string(data))
-			}
-			return err
-		})
-	}
-	printStep("下载 %s %s…", release.TagName, assetName)
-	archive, err := cliDownloadAsset(ctx, asset, dir, sums)
+	printStep("下载 %s %s…", target, asset.Name)
+	archive, err := cliDownloadAsset(ctx, asset, dir, nil)
 	if err != nil {
 		return err
 	}

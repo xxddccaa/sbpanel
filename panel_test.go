@@ -329,64 +329,64 @@ func TestHandlerOpenWithoutLogin(t *testing.T) {
 	}
 }
 
-// TestInstallPanelFromRelease runs the whole download against a fake GitHub: release
-// lookup, SHA-256 from the asset digest or from sha256sums.txt, extraction, the
-// version check, and the swap into place.
+// fakeGitHub serves the github.com pages the release lookup uses: /releases/latest
+// redirecting to the tag, and the release downloads.
+func fakeGitHub(t *testing.T, tag string, files map[string][]byte) {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/releases/latest":
+			http.Redirect(w, r, "/releases/tag/"+tag, http.StatusFound)
+		case r.URL.Path == "/releases/tag/"+tag:
+			w.Write([]byte("<html>release page</html>"))
+		case strings.HasPrefix(r.URL.Path, "/releases/download/"+tag+"/"):
+			data, ok := files[strings.TrimPrefix(r.URL.Path, "/releases/download/"+tag+"/")]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			w.Write(data)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	original := sbpanelWebURL
+	sbpanelWebURL = server.URL
+	t.Cleanup(func() { sbpanelWebURL = original })
+}
+
+// TestInstallPanelFromRelease runs the whole download against a fake github.com:
+// the latest tag from the redirect, the SHA-256 from sha256sums.txt, extraction,
+// the version check and the swap into place. No GitHub API is involved.
 func TestInstallPanelFromRelease(t *testing.T) {
 	assetName, err := sbpanelAssetName()
 	if err != nil {
 		t.Skip("platform has no release build")
 	}
-	for _, viaSums := range []bool{false, true} {
-		t.Run(map[bool]string{false: "digest", true: "sha256sums"}[viaSums], func(t *testing.T) {
-			script := "#!/bin/sh\necho 'sbpanel v9.9.9'\n"
-			archive := tarGz(t, "sbpanel", script)
-			sum := sha256Hex(archive)
+	archive := tarGz(t, "sbpanel", "#!/bin/sh\necho 'sbpanel v9.9.9'\n")
+	fakeGitHub(t, "v9.9.9", map[string][]byte{
+		assetName:        archive,
+		"sha256sums.txt": []byte(sha256Hex(archive) + "  " + assetName + "\n"),
+	})
 
-			var server *httptest.Server
-			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				asset := map[string]any{"name": assetName, "size": len(archive), "browser_download_url": server.URL + "/dl/" + assetName}
-				if !viaSums {
-					asset["digest"] = "sha256:" + sum
-				}
-				switch r.URL.Path {
-				case "/releases/latest", "/releases/tags/v9.9.9":
-					writeJSON(w, http.StatusOK, map[string]any{
-						"tag_name": "v9.9.9", "published_at": time.Now(),
-						"assets": []any{asset, map[string]any{"name": "sha256sums.txt", "browser_download_url": server.URL + "/dl/sums"}},
-					})
-				case "/dl/" + assetName:
-					w.Write(archive)
-				case "/dl/sums":
-					w.Write([]byte(sum + "  " + assetName + "\n"))
-				default:
-					http.NotFound(w, r)
-				}
-			}))
-			defer server.Close()
-			original := sbpanelReleasesAPI
-			sbpanelReleasesAPI = server.URL + "/releases"
-			defer func() { sbpanelReleasesAPI = original }()
-
-			dir := t.TempDir()
-			app := &App{core: &Core{}, panel: &PanelUpdater{dir: dir, ctx: context.Background(), supervised: true}}
-			if err := app.CheckPanelRelease(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-			if release := app.panel.View().Release; release == nil || release.Tag != "v9.9.9" || release.Via != routeNameDirect {
-				t.Fatalf("release = %+v", release)
-			}
-			message, err := app.installPanel(context.Background(), "v9.9.9")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got, _ := sbpanelBinaryVersion(panelBinaryPath(dir)); got != "v9.9.9" || !fileExists(panelPendingPath(dir)) {
-				t.Fatalf("installed %q, pending %v (%s)", got, fileExists(panelPendingPath(dir)), message)
-			}
-			if fileExists(panelArchivePath(dir)) || fileExists(panelCandidatePath(dir)) {
-				t.Fatal("temporary files left behind")
-			}
-		})
+	dir := t.TempDir()
+	app := &App{core: &Core{}, panel: &PanelUpdater{dir: dir, ctx: context.Background(), supervised: true}}
+	if err := app.CheckPanelRelease(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if release := app.panel.View().Release; release == nil || release.Tag != "v9.9.9" || release.Via != routeNameDirect {
+		t.Fatalf("release = %+v", release)
+	}
+	message, err := app.installPanel(context.Background(), "v9.9.9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := sbpanelBinaryVersion(panelBinaryPath(dir)); got != "v9.9.9" || !fileExists(panelPendingPath(dir)) {
+		t.Fatalf("installed %q, pending %v (%s)", got, fileExists(panelPendingPath(dir)), message)
+	}
+	if fileExists(panelArchivePath(dir)) || fileExists(panelCandidatePath(dir)) {
+		t.Fatal("temporary files left behind")
 	}
 }
 
@@ -395,21 +395,10 @@ func TestInstallPanelRejectsBadChecksum(t *testing.T) {
 	if err != nil {
 		t.Skip("platform has no release build")
 	}
-	archive := tarGz(t, "sbpanel", "#!/bin/sh\necho 'sbpanel v9.9.9'\n")
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/dl" {
-			w.Write(archive)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"tag_name": "v9.9.9", "assets": []any{map[string]any{
-			"name": assetName, "browser_download_url": server.URL + "/dl", "digest": "sha256:" + strings.Repeat("0", 64)}}})
-	}))
-	defer server.Close()
-	original := sbpanelReleasesAPI
-	sbpanelReleasesAPI = server.URL + "/releases"
-	defer func() { sbpanelReleasesAPI = original }()
-
+	fakeGitHub(t, "v9.9.9", map[string][]byte{
+		assetName:        tarGz(t, "sbpanel", "#!/bin/sh\necho 'sbpanel v9.9.9'\n"),
+		"sha256sums.txt": []byte(strings.Repeat("0", 64) + "  " + assetName + "\n"),
+	})
 	dir := t.TempDir()
 	app := &App{core: &Core{}, panel: &PanelUpdater{dir: dir, ctx: context.Background(), supervised: true}}
 	if _, err := app.installPanel(context.Background(), "v9.9.9"); err == nil || !strings.Contains(err.Error(), "SHA-256") {
@@ -417,6 +406,17 @@ func TestInstallPanelRejectsBadChecksum(t *testing.T) {
 	}
 	if fileExists(panelBinaryPath(dir)) {
 		t.Fatal("unverified download must not be installed")
+	}
+	if _, err := app.installPanel(context.Background(), "v9.9.8"); err == nil || !strings.Contains(err.Error(), "不存在") {
+		t.Fatalf("missing release: err = %v", err)
+	}
+}
+
+func TestLatestTagThroughMirror(t *testing.T) {
+	// A GH_PROXY mirror keeps the github.com URL in its path.
+	request := httptest.NewRequest(http.MethodGet, "https://ghfast.top/https://github.com/x/sbpanel/releases/tag/v1.2.3", nil)
+	if match := releaseTagURLPattern.FindStringSubmatch(request.URL.Path); match == nil || match[1] != "v1.2.3" {
+		t.Fatalf("match = %v", match)
 	}
 }
 

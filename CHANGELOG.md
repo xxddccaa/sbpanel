@@ -2,6 +2,13 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.3.1] - 2026-11-25
+
+### 修复
+- v0.1.0 不支持容器，在 DSW 这类没有 systemd 的机器上只能手动运行 `sbpanel serve`，而它的 `sbpanel update` 会报“systemd 没有在运行”。现在重新运行一键安装脚本会找到这个手动运行的面板，停掉它，换成新版本的后台服务，订阅和设置照常保留（以前会报“面板端口已经被占用”）
+- `sbpanel status` 能认出手动运行、还没安装成服务的面板
+- 检查和下载 sbpanel 新版本不再使用 GitHub API。API 不登录时每个 IP 每小时只能用 60 次，云服务器、DSW 这类很多人共用出口 IP 的机器经常被拒绝（HTTP 403）。现在从 github.com 的发布页读取最新版本号，用发布包里的 `sha256sums.txt` 校验。网页里的“检查更新”、升级和 `sbpanel update` 都是这样
+
 ## [v0.3.0] - 2026-11-25
 
 ### 变化

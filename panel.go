@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,8 +48,6 @@ const (
 
 var (
 	errPanelRestart = errors.New("panel restart requested")
-
-	sbpanelReleasesAPI = "https://api.github.com/repos/" + githubRepo + "/releases"
 
 	// Long enough for app.Startup, which may wait for sing-box to come up.
 	panelReadyTimeout = 90 * time.Second
@@ -301,12 +300,11 @@ func (r *panelReadySignal) send() error {
 }
 
 type PanelRelease struct {
-	Tag         string    `json:"tag"`
-	Version     string    `json:"version"`
-	PublishedAt time.Time `json:"publishedAt"`
-	URL         string    `json:"url"`
-	CheckedAt   time.Time `json:"checkedAt"`
-	Via         string    `json:"via"`
+	Tag       string    `json:"tag"`
+	Version   string    `json:"version"`
+	URL       string    `json:"url"`
+	CheckedAt time.Time `json:"checkedAt"`
+	Via       string    `json:"via"`
 }
 
 // PanelJob reports a running or finished download, like KernelJob.
@@ -421,25 +419,90 @@ func (p *PanelUpdater) View() PanelView {
 
 // CheckPanelRelease looks up the newest sbpanel release, through the proxy first.
 func (a *App) CheckPanelRelease(ctx context.Context) error {
-	var release githubRelease
-	via, err := a.fetchGitHubJSON(ctx, sbpanelReleasesAPI+"/latest", &release)
+	tag, via, err := latestSbpanelTag(ctx, a.fetchWithFallback)
 	if err != nil {
-		return fmt.Errorf("获取 sbpanel 版本信息失败: %w", err)
-	}
-	if !releaseTagPattern.MatchString(release.TagName) {
-		return fmt.Errorf("GitHub 返回的版本号 %q 格式不对", release.TagName)
+		return err
 	}
 	a.panel.mu.Lock()
 	a.panel.release = &PanelRelease{
-		Tag:         release.TagName,
-		Version:     strings.TrimPrefix(release.TagName, "v"),
-		PublishedAt: release.PublishedAt,
-		URL:         projectURL + "/releases/tag/" + release.TagName,
-		CheckedAt:   time.Now(),
-		Via:         via,
+		Tag:       tag,
+		Version:   strings.TrimPrefix(tag, "v"),
+		URL:       sbpanelWebURL + "/releases/tag/" + tag,
+		CheckedAt: time.Now(),
+		Via:       via,
 	}
 	a.panel.mu.Unlock()
 	return nil
+}
+
+// ---- release lookup without the GitHub API ----
+//
+// The API allows 60 anonymous requests an hour per IP address. Cloud machines and
+// notebooks (DSW and the like) share their address with many others and often find
+// the allowance used up. github.com itself has no such limit, so the newest tag is
+// read from where /releases/latest redirects to, and the SHA-256 comes from the
+// sha256sums.txt every release carries.
+
+// fetchFunc fetches a URL; it matches App.fetchWithFallback.
+type fetchFunc func(ctx context.Context, rawURL string, header http.Header, timeout time.Duration,
+	consume func(*http.Response) error) (via string, err error)
+
+var (
+	sbpanelWebURL        = projectURL // replaced in tests
+	releaseTagURLPattern = regexp.MustCompile(`/releases/tag/([^/?#]+)$`)
+)
+
+func sbpanelDownloadURL(tag, name string) string {
+	return sbpanelWebURL + "/releases/download/" + tag + "/" + name
+}
+
+func plainHeader() http.Header { return http.Header{"User-Agent": {"sbpanel/" + version}} }
+
+// latestSbpanelTag returns the newest release's tag.
+func latestSbpanelTag(ctx context.Context, fetch fetchFunc) (tag, via string, err error) {
+	via, err = fetch(ctx, sbpanelWebURL+"/releases/latest", plainHeader(), releaseAPITimeout, func(response *http.Response) error {
+		match := releaseTagURLPattern.FindStringSubmatch(response.Request.URL.Path)
+		if match == nil {
+			return errors.New("GitHub 没有跳转到最新版本")
+		}
+		tag = match[1]
+		return nil
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("获取 sbpanel 最新版本失败: %w", err)
+	}
+	if !releaseTagPattern.MatchString(tag) {
+		return "", "", fmt.Errorf("最新版本号 %q 格式不对", tag)
+	}
+	return tag, via, nil
+}
+
+// sbpanelReleaseAsset returns this machine's package of a release, with the SHA-256
+// from the release's sha256sums.txt.
+func sbpanelReleaseAsset(ctx context.Context, fetch fetchFunc, tag string) (*githubAsset, error) {
+	name, err := sbpanelAssetName()
+	if err != nil {
+		return nil, err
+	}
+	var sums map[string]string
+	_, err = fetch(ctx, sbpanelDownloadURL(tag, "sha256sums.txt"), plainHeader(), releaseAPITimeout, func(response *http.Response) error {
+		data, err := readLimited(response.Body, 1<<20)
+		if err == nil {
+			sums = parseSHA256Sums(string(data))
+		}
+		return err
+	})
+	var status *httpStatusError
+	if errors.As(err, &status) && status.code == http.StatusNotFound {
+		return nil, fmt.Errorf("版本 %s 不存在", tag)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("下载 %s 的 sha256sums.txt 失败: %w", tag, err)
+	}
+	if sums[name] == "" {
+		return nil, fmt.Errorf("版本 %s 的 sha256sums.txt 里没有 %s，无法校验，已取消", tag, name)
+	}
+	return &githubAsset{Name: name, BrowserDownloadURL: sbpanelDownloadURL(tag, name), Digest: "sha256:" + sums[name]}, nil
 }
 
 // StartPanelInstall downloads a release in the background, then restarts into it.
@@ -487,33 +550,21 @@ func (a *App) installPanel(ctx context.Context, tag string) (string, error) {
 	if err := os.MkdirAll(p.dir, 0o700); err != nil {
 		return "", err
 	}
-	assetName, err := sbpanelAssetName()
+	p.updateJob(func(job *PanelJob) { job.Stage = "获取校验值" })
+	asset, err := sbpanelReleaseAsset(ctx, a.fetchWithFallback, tag)
 	if err != nil {
 		return "", err
 	}
+	want := strings.TrimPrefix(asset.Digest, "sha256:")
 
-	p.updateJob(func(job *PanelJob) { job.Stage = "获取版本信息" })
-	var release githubRelease
-	if _, err := a.fetchGitHubJSON(ctx, sbpanelReleasesAPI+"/tags/"+tag, &release); err != nil {
-		return "", fmt.Errorf("获取版本 %s 的信息失败: %w", tag, err)
-	}
-	asset, err := findAsset(&release, assetName)
-	if err != nil {
-		return "", err
-	}
-	want, ok := strings.CutPrefix(asset.Digest, "sha256:")
-	if !ok {
-		want, err = a.releaseChecksum(ctx, &release, assetName)
-		if err != nil {
-			return "", err
-		}
-	}
-
-	p.updateJob(func(job *PanelJob) { job.Stage = "下载中"; job.Total = asset.Size })
+	p.updateJob(func(job *PanelJob) { job.Stage = "下载中" })
 	archive := panelArchivePath(p.dir)
 	defer os.Remove(archive)
-	via, err := a.fetchWithFallback(ctx, asset.BrowserDownloadURL, http.Header{"User-Agent": {"sbpanel/" + version}},
+	via, err := a.fetchWithFallback(ctx, asset.BrowserDownloadURL, plainHeader(),
 		panelDownloadTimeout, func(response *http.Response) error {
+			if response.ContentLength > 0 {
+				p.updateJob(func(job *PanelJob) { job.Total = response.ContentLength })
+			}
 			return downloadVerified(response.Body, archive, want, func(done int64) {
 				p.updateJob(func(job *PanelJob) { job.Done = done })
 			})
@@ -541,30 +592,6 @@ func (a *App) installPanel(ctx context.Context, tag string) (string, error) {
 		return "", fmt.Errorf("替换程序失败: %w", err)
 	}
 	return fmt.Sprintf("sbpanel %s 已下载（通过%s，SHA-256 校验通过），正在重启", tag, via), nil
-}
-
-// releaseChecksum reads an asset's SHA-256 from the release's sha256sums.txt.
-func (a *App) releaseChecksum(ctx context.Context, release *githubRelease, assetName string) (string, error) {
-	sumsAsset, err := findAsset(release, "sha256sums.txt")
-	if err != nil {
-		return "", errors.New("这个版本没有提供 SHA-256，无法校验，已取消")
-	}
-	var sums map[string]string
-	_, err = a.fetchWithFallback(ctx, sumsAsset.BrowserDownloadURL, http.Header{"User-Agent": {"sbpanel/" + version}},
-		releaseAPITimeout, func(response *http.Response) error {
-			data, err := readLimited(response.Body, 1<<20)
-			if err == nil {
-				sums = parseSHA256Sums(string(data))
-			}
-			return err
-		})
-	if err != nil {
-		return "", fmt.Errorf("下载 sha256sums.txt 失败: %w", err)
-	}
-	if sums[assetName] == "" {
-		return "", fmt.Errorf("sha256sums.txt 里没有 %s，无法校验，已取消", assetName)
-	}
-	return sums[assetName], nil
 }
 
 // swapIn makes candidate the panel-installed program and marks it as on trial. The
