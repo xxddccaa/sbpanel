@@ -33,6 +33,8 @@ const usage = `sbpanel —— 在没有桌面的 Linux 上用网页管理 sing-b
 
   日常管理
     sbpanel status       查看运行状态、面板地址、代理是否可用
+    sbpanel url          打印网页面板地址
+    sbpanel open         在浏览器打开网页面板（无桌面环境则打印地址）
     sbpanel start | stop | restart
     sbpanel enable | disable     开机自启
     sbpanel logs [-f]    查看日志（-f 持续输出）
@@ -62,6 +64,8 @@ func main() {
 		"update":    runUpdate,
 		"uninstall": runUninstall,
 		"status":    runStatus,
+		"url":       runURL,
+		"open":      runOpen,
 		"start":     serviceAction("start"),
 		"stop":      serviceAction("stop"),
 		"restart":   serviceAction("restart"),
@@ -97,10 +101,14 @@ func exitOn(err error) {
 	}
 }
 
-func stdinIsTerminal() bool {
-	info, err := os.Stdin.Stat()
+func isTerminal(file *os.File) bool {
+	info, err := file.Stat()
 	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
+
+func stdinIsTerminal() bool { return isTerminal(os.Stdin) }
+
+func stdoutIsTerminal() bool { return isTerminal(os.Stdout) }
 
 func envOr(name, fallback string) string {
 	if value := strings.TrimSpace(os.Getenv(name)); value != "" {

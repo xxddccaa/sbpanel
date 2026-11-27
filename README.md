@@ -129,6 +129,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xxddccaa/sbpanel/main/instal
 | 命令 | 作用 |
 |------|------|
 | `sbpanel status` | 服务状态、面板地址、sing-box 版本、当前节点，并实际测一次代理是否可用 |
+| `sbpanel url` | 只打印当前网页面板地址并立刻退出（不进管理菜单） |
+| `sbpanel open` | 在桌面环境直接用浏览器打开面板；无桌面服务器环境则打印面板地址 |
 | `sbpanel start` / `stop` / `restart` | 启动、停止、重启（停止时代理也会一起停） |
 | `sbpanel enable` / `disable` | 开启、关闭开机自启（只有 systemd 服务方式支持） |
 | `sbpanel logs [-f]` | 查看日志，`-f` 持续输出（systemd 方式读 journald，后台进程方式读日志文件） |

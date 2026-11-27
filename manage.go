@@ -12,8 +12,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -360,8 +362,19 @@ func printStatus(l layout) {
 	fmt.Println(colorBold("sbpanel " + version))
 	row := func(label, value string) { fmt.Printf("  %s  %s\n", padDisplay(label, 8), value) }
 	if !l.installed() {
-		if pid := findServeProcess(l.DataDir); pid != 0 {
-			row("服务", colorGreen("● 运行中")+colorDim(fmt.Sprintf("（PID %d，手动启动的，没有安装成服务；运行 sbpanel install 接管）", pid)))
+		if panel := findManualPanel(l.DataDir, runningPanels()); panel != nil {
+			row("服务", colorGreen("● 运行中")+colorDim(fmt.Sprintf("（PID %d，手动启动的，没有安装成服务；运行 sbpanel install 接管）", panel.PID)))
+			listen := panel.listenAddress()
+			for i, address := range panelURLs(listen) {
+				label := ""
+				if i == 0 {
+					label = "网页面板"
+				}
+				row(label, colorBold(address))
+			}
+			if hint := sshTunnelHint(listen); hint != "" {
+				row("SSH 隧道", colorDim(hint))
+			}
 		} else {
 			row("服务", colorDim("● 未安装")+"（运行 sbpanel install 安装）")
 		}
@@ -619,6 +632,161 @@ func changePanelListen(l layout, address string) error {
 	return nil
 }
 
+// ---- url / open ----
+
+type panelTarget struct {
+	Listen    string
+	Running   bool
+	Installed bool
+	PID       int
+}
+
+// findManualPanel prefers a panel using dataDir and falls back to a sole same-user
+// process (for example `sbpanel serve --data ./dev-data`) when none matches directly.
+func findManualPanel(dataDir string, panels []runningPanel) *runningPanel {
+	var sameUser []*runningPanel
+	for i := range panels {
+		if panels[i].uses(dataDir) {
+			return &panels[i]
+		}
+		if !panels[i].OtherUser {
+			sameUser = append(sameUser, &panels[i])
+		}
+	}
+	if len(sameUser) == 1 {
+		return sameUser[0]
+	}
+	return nil
+}
+
+func resolvePanelTarget(l layout, running *runningPanel, serviceRunning bool) (panelTarget, error) {
+	if l.installed() {
+		return panelTarget{Listen: l.panelListen(), Running: serviceRunning, Installed: true}, nil
+	}
+	if running != nil {
+		return panelTarget{Listen: running.listenAddress(), Running: true, PID: running.PID}, nil
+	}
+	return panelTarget{}, errors.New("sbpanel 还没有安装或运行，先运行 sbpanel install")
+}
+
+func currentPanelTarget(l layout) (panelTarget, error) {
+	if l.installed() {
+		return resolvePanelTarget(l, nil, managerFor(l).Status().Running)
+	}
+	return resolvePanelTarget(l, findManualPanel(l.DataDir, runningPanels()), false)
+}
+
+func sshTunnelHint(listen string) string {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return ""
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return ""
+	}
+	return fmt.Sprintf("ssh -L %s:%s 用户@服务器", port, net.JoinHostPort(host, port))
+}
+
+func writePanelURLs(stdout, stderr io.Writer, target panelTarget, stderrHint bool) error {
+	urls := panelURLs(target.Listen)
+	if len(urls) == 0 {
+		return fmt.Errorf("无法解析面板地址: %s", target.Listen)
+	}
+	for _, address := range urls {
+		fmt.Fprintln(stdout, address)
+	}
+	if !target.Running {
+		fmt.Fprintln(stderr, "提示: 服务当前未运行（运行 sbpanel start 启动）")
+	}
+	if stderrHint {
+		if hint := sshTunnelHint(target.Listen); hint != "" {
+			fmt.Fprintf(stderr, "提示: 远程访问可用 SSH 隧道: %s\n", hint)
+		}
+	}
+	return nil
+}
+
+func runURL(args []string) error {
+	target, err := currentPanelTarget(currentLayout())
+	if err != nil {
+		return err
+	}
+	return writePanelURLs(os.Stdout, os.Stderr, target, stdoutIsTerminal())
+}
+
+func browserCommand(goos string, getenv func(string) string, lookPath func(string) (string, error), targetURL string) (string, []string, bool) {
+	switch goos {
+	case "darwin":
+		if path, err := lookPath("open"); err == nil {
+			return path, []string{targetURL}, true
+		}
+	case "linux":
+		// Avoid invoking xdg-open on headless SSH sessions where it hangs or prints browser errors.
+		if getenv("DISPLAY") == "" && getenv("WAYLAND_DISPLAY") == "" {
+			return "", nil, false
+		}
+		if path, err := lookPath("xdg-open"); err == nil {
+			return path, []string{targetURL}, true
+		}
+	}
+	return "", nil, false
+}
+
+func openPanelTarget(target panelTarget, stdout, stderr io.Writer, goos string,
+	getenv func(string) string, lookPath func(string) (string, error), startCmd func(string, ...string) error) error {
+	if !target.Running {
+		return errors.New("面板服务还没有启动，先运行 sbpanel start")
+	}
+	urls := panelURLs(target.Listen)
+	if len(urls) == 0 {
+		return fmt.Errorf("无法解析面板地址: %s", target.Listen)
+	}
+	cmd, cmdArgs, ok := browserCommand(goos, getenv, lookPath, urls[0])
+	if !ok {
+		for _, address := range urls {
+			fmt.Fprintln(stdout, address)
+		}
+		fmt.Fprintln(stderr, "提示: 当前没有图形桌面，请在本地浏览器打开上面的地址")
+		if hint := sshTunnelHint(target.Listen); hint != "" {
+			fmt.Fprintf(stderr, "提示: 远程访问可用 SSH 隧道: %s\n", hint)
+		}
+		return nil
+	}
+	if err := startCmd(cmd, cmdArgs...); err != nil {
+		for _, address := range urls {
+			fmt.Fprintln(stdout, address)
+		}
+		return fmt.Errorf("打开浏览器失败: %w", err)
+	}
+	fmt.Fprintln(stdout, colorGreen("✓ ")+"已在浏览器打开 "+urls[0])
+	return nil
+}
+
+func runOpen(args []string) error {
+	target, err := currentPanelTarget(currentLayout())
+	if err != nil {
+		return err
+	}
+	return openPanelTarget(target, os.Stdout, os.Stderr, runtime.GOOS, os.Getenv, exec.LookPath,
+		func(name string, cmdArgs ...string) error {
+			return exec.Command(name, cmdArgs...).Start()
+		})
+}
+
+func writeMenuPanelURLs(w io.Writer, listen string, urls []string) {
+	for i, address := range urls {
+		if i == 0 {
+			fmt.Fprintln(w, "  面板: "+colorBold(address))
+		} else {
+			fmt.Fprintln(w, "        "+colorBold(address))
+		}
+	}
+	if hint := sshTunnelHint(listen); hint != "" {
+		fmt.Fprintln(w, "  "+colorDim("隧道: "+hint))
+	}
+}
+
 // ---- interactive menu ----
 
 func runMenu() error {
@@ -645,7 +813,14 @@ func runMenu() error {
 		fmt.Println(colorBold("  sbpanel 管理菜单") + colorDim("  "+version))
 		fmt.Println(colorDim("  ─────────────────────────────────"))
 		if !l.installed() {
-			fmt.Println("  还没有安装。")
+			if panel := findManualPanel(l.DataDir, runningPanels()); panel != nil {
+				fmt.Printf("  服务: %s%s\n", colorGreen("● 运行中"), colorDim(fmt.Sprintf("（PID %d，手动启动）", panel.PID)))
+				listen := panel.listenAddress()
+				writeMenuPanelURLs(os.Stdout, listen, panelURLs(listen))
+				fmt.Println(colorDim("  还没有安装成服务，选 1 可安装并接管。"))
+			} else {
+				fmt.Println("  还没有安装。")
+			}
 			fmt.Println()
 			fmt.Println("   1. 安装")
 			fmt.Println("   0. 退出")
@@ -662,12 +837,11 @@ func runMenu() error {
 		manager := managerFor(l)
 		status := manager.Status()
 		supported, enabled := manager.Autostart()
-		urls := panelURLs(l.panelListen())
+		listen := l.panelListen()
+		urls := panelURLs(listen)
 		fmt.Printf("  服务: %s\n", describeService(status))
 		fmt.Printf("  运行方式: %s   开机自启: %s\n", manager.Describe(), describeAutostart(manager))
-		if len(urls) > 0 {
-			fmt.Println("  面板: " + urls[0])
-		}
+		writeMenuPanelURLs(os.Stdout, listen, urls)
 		autostart := "开启开机自启"
 		if !supported {
 			autostart = "开机自启说明"
